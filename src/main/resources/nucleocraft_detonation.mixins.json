@@ -1,0 +1,13 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "com.github.loganmartingreen.nucleocraftdetonation.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "client": [
+    "client.ClientLevelSkyColourMixin",
+    "client.BiomeColorsWaterMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

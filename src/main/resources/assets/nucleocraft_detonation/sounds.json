@@ -1,0 +1,10 @@
+{
+  "nuclear_blast": {
+    "sounds": [
+      {
+        "name": "nucleocraft_detonation:nuclear_blast",
+        "stream": true
+      }
+    ]
+  }
+}
