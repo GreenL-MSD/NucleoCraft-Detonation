@@ -1,0 +1,9 @@
+{
+  "replace": false,
+  "values": [
+    "nucleocraft_detonation:charred_planks",
+    "nucleocraft_detonation:charred_log",
+    "nucleocraft_detonation:charred_plank_stairs",
+    "nucleocraft_detonation:charred_plank_slab"
+  ]
+}

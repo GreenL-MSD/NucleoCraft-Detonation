@@ -1,0 +1,7 @@
+{
+  "parent": "minecraft:block/cube_column",
+  "textures": {
+    "end": "nucleocraft_detonation:block/charred_log_top",
+    "side": "nucleocraft_detonation:block/charred_log_side"
+  }
+}

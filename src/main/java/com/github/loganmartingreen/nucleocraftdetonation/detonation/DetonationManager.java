@@ -8,6 +8,7 @@ import com.github.loganmartingreen.nucleocraftdetonation.network.DetonationNetwo
 import com.github.loganmartingreen.nucleocraftdetonation.network.DetonationNetwork.PersistentVisualEntry;
 import com.github.loganmartingreen.nucleocraftdetonation.network.DetonationNetwork.PersistentVisualSyncPayload;
 import com.github.loganmartingreen.nucleocraftdetonation.persistence.DetonationSavedData;
+import com.github.loganmartingreen.nucleocraftdetonation.terrain.FalloutTerrainManager;
 
 import net.minecraft.core.BlockPos;
 import net.minecraft.network.chat.Component;
@@ -81,6 +82,7 @@ public final class DetonationManager {
             COUNTDOWNS.clear();
             ACTIVE_CRATERS.clear();
             LAST_SYNCED_DIMENSION.clear();
+            FalloutTerrainManager.clear();
             previousServer = server;
         }
 
@@ -88,6 +90,7 @@ public final class DetonationManager {
         syncPlayersWhenNeeded(server);
         tickCountdowns(server);
         tickCraters(server);
+        FalloutTerrainManager.tick(server);
     }
 
 
@@ -191,7 +194,7 @@ public final class DetonationManager {
                  * Send the flash, delayed sound and permanent fallout before
                  * the first crater terrain pass begins.
                  */
-                broadcastDetonation(
+                long terrainEffectId = broadcastDetonation(
                         level,
                         countdown.centre,
                         craterTask.dimensions()
@@ -200,7 +203,8 @@ public final class DetonationManager {
                 ACTIVE_CRATERS.add(
                         new ActiveCrater(
                                 countdown.dimension,
-                                craterTask
+                                craterTask,
+                                terrainEffectId
                         )
                 );
 
@@ -277,12 +281,22 @@ public final class DetonationManager {
                         )
                 );
 
+                DetonationSavedData savedData =
+                        DetonationSavedData.get(server);
+                savedData.startTerrainConversion(
+                        activeCrater.terrainEffectId
+                );
+                FalloutTerrainManager.startInitialSweep(
+                        level,
+                        activeCrater.terrainEffectId
+                );
+
                 iterator.remove();
             }
         }
     }
 
-    private static void broadcastDetonation(
+    private static long broadcastDetonation(
             ServerLevel level,
             BlockPos centre,
             CraterDimensions dimensions
@@ -317,8 +331,9 @@ public final class DetonationManager {
                                 .MAXIMUM_SOUND_RADIUS
                 );
 
-        DetonationSavedData.get(level.getServer())
-                .addDetonation(
+        long terrainEffectId =
+                DetonationSavedData.get(level.getServer())
+                        .addDetonation(
                         level.dimension(),
                         centre,
                         falloutRadius,
@@ -348,6 +363,9 @@ public final class DetonationManager {
                         DetonationTuning.Fallout.STRENGTH
                 )
         );
+
+
+        return terrainEffectId;
     }
 
     private static void sendToOwner(
@@ -389,7 +407,8 @@ public final class DetonationManager {
 
     private record ActiveCrater(
             ResourceKey<Level> dimension,
-            CraterTask task
+            CraterTask task,
+            long terrainEffectId
     ) {
     }
 }

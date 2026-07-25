@@ -1,0 +1,16 @@
+{
+  "variants": {
+    "axis=y": {
+      "model": "nucleocraft_detonation:block/charred_log"
+    },
+    "axis=z": {
+      "model": "nucleocraft_detonation:block/charred_log_horizontal",
+      "x": 90
+    },
+    "axis=x": {
+      "model": "nucleocraft_detonation:block/charred_log_horizontal",
+      "x": 90,
+      "y": 90
+    }
+  }
+}

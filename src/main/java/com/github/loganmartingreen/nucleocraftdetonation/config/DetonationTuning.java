@@ -86,6 +86,112 @@ public final class DetonationTuning {
         }
     }
 
+    /** Permanent block conversion, blast damage and outward fallout spread. */
+    public static final class FalloutTerrain {
+        /*
+         * The v24 terrain rules are applied as a high-budget radial block wave.
+         * This is deliberately not tied to a fixed metres-per-second timer.
+         */
+        public static final int SPREAD_MAX_AGE_TICKS = 1;
+        public static final int BLOCK_CHECKS_PER_TICK = 250_000;
+        public static final int CATCH_UP_BLOCK_CHECKS_PER_TICK = 80_000;
+
+        public static final int VEGETATION_SCAN_DEPTH = 160;
+        public static final int GROUND_SEARCH_DEPTH = 160;
+        public static final int SURFACE_STONE_DEPTH = 6;
+        public static final int CHARRED_DIRT_DEPTH = 8;
+        public static final int CHARRED_SAND_DEPTH = 12;
+        public static final double CHARRED_SOIL_BASE_CHANCE = 0.72D;
+        public static final double CHARRED_SOIL_SEVERITY_BONUS = 0.28D;
+
+        public static final double REFERENCE_CRATER_RADIUS_BLOCKS = 32.0D;
+
+        /* Original v24 fully-charred core scaling. */
+        public static final double STONE_CORE_RADIUS_MULTIPLIER = 1.65D;
+        public static final double STONE_CORE_RADIUS_PADDING = 24.0D;
+        public static final double STONE_CORE_DEPTH_MULTIPLIER = 0.55D;
+        public static final double STONE_CORE_DEPTH_PADDING = 24.0D;
+        public static final int MINIMUM_STONE_CORE_DEPTH = 48;
+        public static final int MAXIMUM_STONE_CORE_DEPTH = 192;
+
+        public static final double BROAD_NOISE_SCALE = 82.0D;
+        public static final double DETAIL_NOISE_SCALE = 23.0D;
+        public static final double BROAD_NOISE_EDGE_STRENGTH = 0.095D;
+        public static final double DETAIL_NOISE_EDGE_STRENGTH = 0.035D;
+
+        public static final double CHARRED_STONE_0_RATIO = 0.60D;
+
+        public static final double GROUND_CONVERSION_BASE_CHANCE = 0.22D;
+        public static final double GROUND_CONVERSION_SEVERITY_BONUS = 0.95D;
+        public static final double GROUND_CHAR_START_SEVERITY = 0.28D;
+        public static final double GROUND_CHAR_SEVERITY_RANGE = 0.58D;
+        public static final double OUTER_STONE_MAX_CHANCE = 0.78D;
+
+        public static final double LOG_CONVERSION_BASE_CHANCE = 0.62D;
+        public static final double LOG_CONVERSION_SEVERITY_BONUS = 0.45D;
+        public static final double PLANK_CONVERSION_BASE_CHANCE = 0.48D;
+        public static final double PLANK_CONVERSION_SEVERITY_BONUS = 0.55D;
+
+        public static final double LEAF_FULL_REMOVAL_SEVERITY = 0.26D;
+        public static final double LEAF_NOISE_STRENGTH = 0.10D;
+        public static final double OUTER_LEAF_REMOVAL_BASE_CHANCE = 0.42D;
+
+        /*
+         * For a 10 kt crater, trees are completely stripped/cut within
+         * 30 blocks beyond the crater edge. Stumps become taller farther out.
+         */
+        public static final double TREE_CUT_EDGE_DISTANCE_AT_REFERENCE = 30.0D;
+        public static final int TREE_MAX_STUMP_HEIGHT = 8;
+        public static final double TREE_STUMP_HEIGHT_POWER = 1.30D;
+
+        /*
+         * Clears everything above the crater rim inside a yield-scaled circular
+         * blast volume. This can cut a large circular bite out of a mountain.
+         */
+        public static final double BLAST_CLEAR_EDGE_DISTANCE_AT_REFERENCE = 20.0D;
+        public static final double BLAST_CLEAR_RADIUS_NOISE_STRENGTH = 0.045D;
+        public static final int BLAST_CLEAR_ABOVE_RIM_OFFSET = 3;
+
+        /*
+         * Random TNT-style surface pits outside the main crater. Candidate
+         * explosions are scattered independently in small cells, with their
+         * density, radius and depth decreasing toward the fallout boundary.
+         * No rubble lip is generated.
+         */
+        public static final double SECONDARY_BLAST_INNER_PADDING = 10.0D;
+        public static final int SECONDARY_BLAST_CELL_SIZE = 9;
+        public static final double SECONDARY_BLAST_NEAR_CELL_CHANCE = 0.72D;
+        public static final double SECONDARY_BLAST_FAR_CELL_CHANCE = 0.04D;
+        public static final double SECONDARY_BLAST_DENSITY_POWER = 1.20D;
+        public static final double SECONDARY_BLAST_NEAR_RADIUS = 5.2D;
+        public static final double SECONDARY_BLAST_FAR_RADIUS = 2.1D;
+        public static final double SECONDARY_BLAST_RADIUS_VARIATION = 0.34D;
+        public static final double SECONDARY_BLAST_NEAR_DEPTH = 4.5D;
+        public static final double SECONDARY_BLAST_FAR_DEPTH = 1.25D;
+        public static final double SECONDARY_BLAST_IRREGULARITY = 0.30D;
+
+        /* Noisy top-down structural damage outside the fully cleared core. */
+        public static final double BUILDING_DAMAGE_BASE_CHANCE = 0.08D;
+        public static final double BUILDING_DAMAGE_SEVERITY_BONUS = 0.56D;
+        public static final double BUILDING_DAMAGE_HEIGHT_BONUS = 0.28D;
+        public static final double BUILDING_DAMAGE_CLUSTER_SCALE = 7.0D;
+        public static final double BUILDING_DAMAGE_CLUSTER_STRENGTH = 0.18D;
+
+        /* One-time effects applied to mobs as the radial terrain wave reaches them. */
+        public static final int ENTITY_CHECK_INTERVAL_TICKS = 4;
+        public static final double ENTITY_KILL_DISTANCE_RATIO = 0.30D;
+        public static final double ENTITY_HEAVY_DAMAGE_DISTANCE_RATIO = 0.68D;
+        public static final int ENTITY_HEAVY_FIRE_SECONDS = 18;
+        public static final int ENTITY_OUTER_FIRE_SECONDS = 7;
+        public static final float ENTITY_HEAVY_DAMAGE_FRACTION = 0.72F;
+        public static final float ENTITY_HEAVY_DAMAGE_MINIMUM = 12.0F;
+        public static final float ENTITY_OUTER_DAMAGE_FRACTION = 0.28F;
+        public static final float ENTITY_OUTER_DAMAGE_MINIMUM = 4.0F;
+
+        private FalloutTerrain() {
+        }
+    }
+
     public static final class ImmediateEffects {
         public static final int FLASH_RGB = 0xFFFBEA;
         public static final int FLASH_HOLD_TICKS = 80;
@@ -191,11 +297,11 @@ public final class DetonationTuning {
          */
         public static final int CRATER_EDGE_RING_START_TICKS = 25;
         public static final double CRATER_EDGE_RING_RADIUS_MULTIPLIER = 1.00D;
-        public static final double CRATER_EDGE_RING_THICKNESS_RATIO = 0.055D;
-        public static final double CRATER_EDGE_RING_MINIMUM_THICKNESS = 0.85D;
-        public static final int CRATER_EDGE_RING_PARTICLES_PER_TICK = 18;
-        public static final int MATURE_CRATER_EDGE_RING_PARTICLES_PER_TICK = 2;
-        public static final float CRATER_EDGE_RING_MAX_POOF_SCALE = 6.5F;
+        public static final double CRATER_EDGE_RING_THICKNESS_RATIO = 0.110D;
+        public static final double CRATER_EDGE_RING_MINIMUM_THICKNESS = 1.70D;
+        public static final int CRATER_EDGE_RING_PARTICLES_PER_TICK = 32;
+        public static final int MATURE_CRATER_EDGE_RING_PARTICLES_PER_TICK = 4;
+        public static final float CRATER_EDGE_RING_MAX_POOF_SCALE = 13.0F;
 
         /*
          * A compact grey smoke ring forms beneath the cap once the head has
