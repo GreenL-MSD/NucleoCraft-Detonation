@@ -2,6 +2,7 @@ package com.github.loganmartingreen.nucleocraftdetonation.network;
 
 import com.github.loganmartingreen.nucleocraftdetonation.NucleoCraftDetonation;
 import com.github.loganmartingreen.nucleocraftdetonation.client.DetonationClient;
+import com.github.loganmartingreen.nucleocraftdetonation.compat.distanthorizons.DistantHorizonsCompat;
 
 import net.minecraft.core.BlockPos;
 import net.minecraft.network.RegistryFriendlyByteBuf;
@@ -16,14 +17,18 @@ import net.neoforged.neoforge.network.event.RegisterPayloadHandlersEvent;
 import net.neoforged.neoforge.network.handling.IPayloadContext;
 import net.neoforged.neoforge.network.registration.PayloadRegistrar;
 
+import java.util.ArrayList;
+import java.util.List;
+
 /**
- * Contains both client-bound detonation payloads and their registration.
+ * Contains client-bound detonation payloads and their registration.
  */
 @EventBusSubscriber(
-        modid = NucleoCraftDetonation.MOD_ID,
-        bus = EventBusSubscriber.Bus.MOD
+        modid = NucleoCraftDetonation.MOD_ID
 )
 public final class DetonationNetwork {
+    private static final int MAX_PERSISTENT_EFFECTS_PER_SYNC = 4_096;
+
     private DetonationNetwork() {
     }
 
@@ -32,7 +37,7 @@ public final class DetonationNetwork {
             RegisterPayloadHandlersEvent event
     ) {
         PayloadRegistrar registrar =
-                event.registrar("1");
+                event.registrar("3");
 
         registrar.playToClient(
                 FalloutVisualPayload.TYPE,
@@ -44,6 +49,18 @@ public final class DetonationNetwork {
                 DetonationEffectsPayload.TYPE,
                 DetonationEffectsPayload.STREAM_CODEC,
                 DetonationNetwork::handleDetonationEffects
+        );
+
+        registrar.playToClient(
+                PersistentVisualSyncPayload.TYPE,
+                PersistentVisualSyncPayload.STREAM_CODEC,
+                DetonationNetwork::handlePersistentVisualSync
+        );
+
+        registrar.playToClient(
+                CraterLodRefreshPayload.TYPE,
+                CraterLodRefreshPayload.STREAM_CODEC,
+                DetonationNetwork::handleCraterLodRefresh
         );
     }
 
@@ -59,6 +76,23 @@ public final class DetonationNetwork {
             IPayloadContext context
     ) {
         DetonationClient.startDetonation(payload);
+    }
+
+    private static void handlePersistentVisualSync(
+            PersistentVisualSyncPayload payload,
+            IPayloadContext context
+    ) {
+        DetonationClient.replacePersistentVisuals(payload);
+    }
+
+    private static void handleCraterLodRefresh(
+            CraterLodRefreshPayload payload,
+            IPayloadContext context
+    ) {
+        DistantHorizonsCompat.queueCraterRefresh(
+                payload.centre(),
+                payload.affectedRadius()
+        );
     }
 
     public record FalloutVisualPayload(
@@ -143,5 +177,169 @@ public final class DetonationNetwork {
         public Type<? extends CustomPacketPayload> type() {
             return TYPE;
         }
+    }
+
+    /**
+     * Tells compatible clients that a completed crater's real chunks should
+     * replace any stale distant terrain cached by Distant Horizons.
+     */
+    public record CraterLodRefreshPayload(
+            BlockPos centre,
+            int affectedRadius
+    ) implements CustomPacketPayload {
+        public static final Type<CraterLodRefreshPayload> TYPE =
+                new Type<>(
+                        ResourceLocation.fromNamespaceAndPath(
+                                NucleoCraftDetonation.MOD_ID,
+                                "refresh_crater_lod"
+                        )
+                );
+
+        public static final StreamCodec<
+                RegistryFriendlyByteBuf,
+                CraterLodRefreshPayload
+                > STREAM_CODEC =
+                StreamCodec.composite(
+                        BlockPos.STREAM_CODEC,
+                        CraterLodRefreshPayload::centre,
+
+                        ByteBufCodecs.VAR_INT,
+                        CraterLodRefreshPayload::affectedRadius,
+
+                        CraterLodRefreshPayload::new
+                );
+
+        public CraterLodRefreshPayload {
+            affectedRadius = Math.max(1, affectedRadius);
+        }
+
+        @Override
+        public Type<? extends CustomPacketPayload> type() {
+            return TYPE;
+        }
+    }
+
+    /**
+     * Replaces the receiving client's persistent fallout/cloud list for its
+     * current dimension. Flash, sound and shockwaves are deliberately omitted
+     * so reconnecting never replays the original blast.
+     */
+    public record PersistentVisualSyncPayload(
+            List<PersistentVisualEntry> entries
+    ) implements CustomPacketPayload {
+        public static final Type<PersistentVisualSyncPayload> TYPE =
+                new Type<>(
+                        ResourceLocation.fromNamespaceAndPath(
+                                NucleoCraftDetonation.MOD_ID,
+                                "sync_persistent_visuals"
+                        )
+                );
+
+        public static final StreamCodec<
+                RegistryFriendlyByteBuf,
+                PersistentVisualSyncPayload
+                > STREAM_CODEC =
+                new StreamCodec<>() {
+                    @Override
+                    public PersistentVisualSyncPayload decode(
+                            RegistryFriendlyByteBuf buffer
+                    ) {
+                        int count = buffer.readVarInt();
+
+                        if (
+                                count < 0
+                                        || count > MAX_PERSISTENT_EFFECTS_PER_SYNC
+                        ) {
+                            throw new IllegalArgumentException(
+                                    "Invalid persistent detonation count: "
+                                            + count
+                            );
+                        }
+
+                        List<PersistentVisualEntry> entries =
+                                new ArrayList<>(count);
+
+                        for (int index = 0; index < count; index++) {
+                            entries.add(
+                                    new PersistentVisualEntry(
+                                            BlockPos.STREAM_CODEC.decode(buffer),
+                                            buffer.readBoolean(),
+                                            buffer.readFloat(),
+                                            buffer.readVarInt(),
+                                            buffer.readVarInt(),
+                                            buffer.readFloat(),
+                                            buffer.readBoolean(),
+                                            buffer.readFloat(),
+                                            buffer.readVarInt(),
+                                            buffer.readFloat()
+                                    )
+                            );
+                        }
+
+                        return new PersistentVisualSyncPayload(
+                                List.copyOf(entries)
+                        );
+                    }
+
+                    @Override
+                    public void encode(
+                            RegistryFriendlyByteBuf buffer,
+                            PersistentVisualSyncPayload value
+                    ) {
+                        List<PersistentVisualEntry> entries =
+                                value.entries();
+
+                        if (
+                                entries.size()
+                                        > MAX_PERSISTENT_EFFECTS_PER_SYNC
+                        ) {
+                            throw new IllegalArgumentException(
+                                    "Too many persistent detonations to sync: "
+                                            + entries.size()
+                            );
+                        }
+
+                        buffer.writeVarInt(entries.size());
+
+                        for (PersistentVisualEntry entry : entries) {
+                            BlockPos.STREAM_CODEC.encode(
+                                    buffer,
+                                    entry.centre()
+                            );
+                            buffer.writeBoolean(entry.falloutActive());
+                            buffer.writeFloat(entry.falloutRadius());
+                            buffer.writeVarInt(entry.falloutDurationTicks());
+                            buffer.writeVarInt(entry.falloutAgeTicks());
+                            buffer.writeFloat(entry.falloutStrength());
+                            buffer.writeBoolean(entry.cloudActive());
+                            buffer.writeFloat(entry.visualScale());
+                            buffer.writeVarInt(entry.cloudAgeTicks());
+                            buffer.writeFloat(entry.cloudStrength());
+                        }
+                    }
+                };
+
+        public PersistentVisualSyncPayload {
+            entries = List.copyOf(entries);
+        }
+
+        @Override
+        public Type<? extends CustomPacketPayload> type() {
+            return TYPE;
+        }
+    }
+
+    public record PersistentVisualEntry(
+            BlockPos centre,
+            boolean falloutActive,
+            float falloutRadius,
+            int falloutDurationTicks,
+            int falloutAgeTicks,
+            float falloutStrength,
+            boolean cloudActive,
+            float visualScale,
+            int cloudAgeTicks,
+            float cloudStrength
+    ) {
     }
 }

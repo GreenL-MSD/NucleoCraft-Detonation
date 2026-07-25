@@ -2,8 +2,12 @@ package com.github.loganmartingreen.nucleocraftdetonation.detonation;
 
 import com.github.loganmartingreen.nucleocraftdetonation.config.DetonationTuning;
 import com.github.loganmartingreen.nucleocraftdetonation.network.DetonationNetwork;
+import com.github.loganmartingreen.nucleocraftdetonation.network.DetonationNetwork.CraterLodRefreshPayload;
 import com.github.loganmartingreen.nucleocraftdetonation.network.DetonationNetwork.DetonationEffectsPayload;
 import com.github.loganmartingreen.nucleocraftdetonation.network.DetonationNetwork.FalloutVisualPayload;
+import com.github.loganmartingreen.nucleocraftdetonation.network.DetonationNetwork.PersistentVisualEntry;
+import com.github.loganmartingreen.nucleocraftdetonation.network.DetonationNetwork.PersistentVisualSyncPayload;
+import com.github.loganmartingreen.nucleocraftdetonation.persistence.DetonationSavedData;
 
 import net.minecraft.core.BlockPos;
 import net.minecraft.network.chat.Component;
@@ -17,8 +21,12 @@ import net.neoforged.neoforge.event.tick.ServerTickEvent;
 import net.neoforged.neoforge.network.PacketDistributor;
 
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 
 /**
@@ -30,6 +38,11 @@ public final class DetonationManager {
 
     private static final List<ActiveCrater> ACTIVE_CRATERS =
             new ArrayList<>();
+
+    private static final Map<UUID, ResourceKey<Level>> LAST_SYNCED_DIMENSION =
+            new HashMap<>();
+
+    private static MinecraftServer previousServer;
 
     private DetonationManager() {
     }
@@ -64,8 +77,72 @@ public final class DetonationManager {
         MinecraftServer server =
                 event.getServer();
 
+        if (previousServer != server) {
+            COUNTDOWNS.clear();
+            ACTIVE_CRATERS.clear();
+            LAST_SYNCED_DIMENSION.clear();
+            previousServer = server;
+        }
+
+        DetonationSavedData.get(server).tick();
+        syncPlayersWhenNeeded(server);
         tickCountdowns(server);
         tickCraters(server);
+    }
+
+
+    private static void syncPlayersWhenNeeded(
+            MinecraftServer server
+    ) {
+        Set<UUID> onlinePlayers = new HashSet<>();
+
+        for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+            UUID playerId = player.getUUID();
+            ResourceKey<Level> dimension =
+                    player.serverLevel().dimension();
+
+            onlinePlayers.add(playerId);
+
+            if (dimension.equals(LAST_SYNCED_DIMENSION.get(playerId))) {
+                continue;
+            }
+
+            syncPersistentVisuals(player);
+            LAST_SYNCED_DIMENSION.put(playerId, dimension);
+        }
+
+        LAST_SYNCED_DIMENSION.keySet().retainAll(onlinePlayers);
+    }
+
+    private static void syncPersistentVisuals(
+            ServerPlayer player
+    ) {
+        List<PersistentVisualEntry> entries =
+                DetonationSavedData.get(
+                                player.serverLevel().getServer()
+                        )
+                        .snapshotsFor(
+                                player.serverLevel().dimension()
+                        )
+                        .stream()
+                        .map(snapshot -> new PersistentVisualEntry(
+                                snapshot.centre(),
+                                snapshot.falloutActive(),
+                                snapshot.falloutRadius(),
+                                snapshot.falloutDurationTicks(),
+                                snapshot.falloutAgeTicks(),
+                                snapshot.falloutStrength(),
+                                snapshot.cloudActive(),
+                                snapshot.visualScale(),
+                                snapshot.cloudAgeTicks(),
+                                snapshot.cloudStrength()
+                        ))
+                        .toList();
+
+        PacketDistributor.sendToPlayer(
+                player,
+                new PersistentVisualSyncPayload(entries)
+        );
     }
 
     private static void tickCountdowns(
@@ -190,6 +267,16 @@ public final class DetonationManager {
                         )
                 );
 
+                PacketDistributor.sendToPlayersInDimension(
+                        level,
+                        new CraterLodRefreshPayload(
+                                task.centre(),
+                                task.dimensions().radius()
+                                        + task.dimensions().rimWidth()
+                                        + 16
+                        )
+                );
+
                 iterator.remove();
             }
         }
@@ -228,6 +315,17 @@ public final class DetonationManager {
                                 .MINIMUM_SOUND_RADIUS,
                         DetonationTuning.ImmediateEffects
                                 .MAXIMUM_SOUND_RADIUS
+                );
+
+        DetonationSavedData.get(level.getServer())
+                .addDetonation(
+                        level.dimension(),
+                        centre,
+                        falloutRadius,
+                        DetonationTuning.Fallout.DURATION_TICKS,
+                        DetonationTuning.Fallout.STRENGTH,
+                        dimensions.radius(),
+                        DetonationTuning.ImmediateEffects.STRENGTH
                 );
 
         PacketDistributor.sendToPlayersInDimension(
