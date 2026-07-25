@@ -406,6 +406,10 @@ final class CraterTask {
         return owner;
     }
 
+    BlockPos centre() {
+        return centre;
+    }
+
     NuclearYield yield() {
         return yield;
     }

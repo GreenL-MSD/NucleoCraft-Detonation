@@ -28,3 +28,11 @@ type="required"
 versionRange="[1.21.1,1.22)"
 ordering="NONE"
 side="BOTH"
+
+[[dependencies.nucleocraft_detonation]]
+modId="distanthorizons"
+type="optional"
+versionRange="[2.2.0,)"
+ordering="AFTER"
+side="CLIENT"
+
