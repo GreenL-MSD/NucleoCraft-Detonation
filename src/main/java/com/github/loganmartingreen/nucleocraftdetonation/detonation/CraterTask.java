@@ -419,17 +419,22 @@ final class CraterTask {
     }
 
     /**
-     * Advances crater generation.
+     * Advances only the crater excavation phase.
+     *
+     * <p>The raised rim is deliberately excluded here. The detonation manager
+     * starts and completes the fallout terrain sweep after excavation, then
+     * calls {@link #tickRim(ServerLevel, int)} so the rim is the final terrain
+     * feature written around the crater.</p>
      *
      * @param level             server world
      * @param maximumOperations maximum terrain positions processed this tick
-     * @return true when excavation and rim generation have finished
+     * @return true when all excavation layers have finished
      */
-    boolean tick(
+    boolean tickExcavation(
             ServerLevel level,
             int maximumOperations
     ) {
-        if (complete) {
+        if (excavationComplete) {
             return true;
         }
 
@@ -438,26 +443,42 @@ final class CraterTask {
         }
 
         ensureReferenceSurface(level);
-
         elapsedTicks++;
+        startReadyExcavationWaves();
 
-        if (!excavationComplete) {
-            startReadyExcavationWaves();
+        processExcavationWaves(
+                level,
+                maximumOperations
+        );
 
-            processExcavationWaves(
-                    level,
-                    maximumOperations
-            );
+        if (
+                planningComplete
+                        && nextLayerToStart
+                        >= plannedLayerCount
+                        && activeWaves.isEmpty()
+        ) {
+            excavationComplete = true;
+        }
 
-            if (
-                    planningComplete
-                            && nextLayerToStart
-                            >= plannedLayerCount
-                            && activeWaves.isEmpty()
-            ) {
-                excavationComplete = true;
-            }
+        return excavationComplete;
+    }
 
+    /**
+     * Generates the raised crater rim after fallout terrain deformation ends.
+     *
+     * @param level             server world
+     * @param maximumOperations maximum terrain positions processed this tick
+     * @return true when the complete rim has been generated
+     */
+    boolean tickRim(
+            ServerLevel level,
+            int maximumOperations
+    ) {
+        if (complete) {
+            return true;
+        }
+
+        if (!excavationComplete || maximumOperations <= 0) {
             return false;
         }
 

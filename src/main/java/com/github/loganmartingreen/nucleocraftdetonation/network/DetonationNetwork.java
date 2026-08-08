@@ -3,6 +3,7 @@ package com.github.loganmartingreen.nucleocraftdetonation.network;
 import com.github.loganmartingreen.nucleocraftdetonation.NucleoCraftDetonation;
 import com.github.loganmartingreen.nucleocraftdetonation.client.DetonationClient;
 import com.github.loganmartingreen.nucleocraftdetonation.compat.distanthorizons.DistantHorizonsCompat;
+import com.github.loganmartingreen.nucleocraftdetonation.terrain.FalloutTerrainManager;
 
 import net.minecraft.core.BlockPos;
 import net.minecraft.network.RegistryFriendlyByteBuf;
@@ -10,6 +11,7 @@ import net.minecraft.network.codec.ByteBufCodecs;
 import net.minecraft.network.codec.StreamCodec;
 import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
 import net.minecraft.resources.ResourceLocation;
+import net.minecraft.server.level.ServerPlayer;
 
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.fml.common.EventBusSubscriber;
@@ -37,7 +39,7 @@ public final class DetonationNetwork {
             RegisterPayloadHandlersEvent event
     ) {
         PayloadRegistrar registrar =
-                event.registrar("3");
+                event.registrar("5");
 
         registrar.playToClient(
                 FalloutVisualPayload.TYPE,
@@ -61,6 +63,24 @@ public final class DetonationNetwork {
                 CraterLodRefreshPayload.TYPE,
                 CraterLodRefreshPayload.STREAM_CODEC,
                 DetonationNetwork::handleCraterLodRefresh
+        );
+
+        registrar.playToClient(
+                TerrainChunkLodRefreshPayload.TYPE,
+                TerrainChunkLodRefreshPayload.STREAM_CODEC,
+                DetonationNetwork::handleTerrainChunkLodRefresh
+        );
+
+        registrar.playToServer(
+                DistantHorizonsPresencePayload.TYPE,
+                DistantHorizonsPresencePayload.STREAM_CODEC,
+                DetonationNetwork::handleDistantHorizonsPresence
+        );
+
+        registrar.playToServer(
+                TerrainChunkLodRefreshCompletePayload.TYPE,
+                TerrainChunkLodRefreshCompletePayload.STREAM_CODEC,
+                DetonationNetwork::handleTerrainChunkLodRefreshComplete
         );
     }
 
@@ -93,6 +113,71 @@ public final class DetonationNetwork {
                 payload.centre(),
                 payload.affectedRadius()
         );
+    }
+
+    private static void handleTerrainChunkLodRefresh(
+            TerrainChunkLodRefreshPayload payload,
+            IPayloadContext context
+    ) {
+        DistantHorizonsCompat.queueChunkRefresh(
+                payload.terrainEffectId(),
+                payload.chunkX(),
+                payload.chunkZ()
+        );
+    }
+
+    private static void handleDistantHorizonsPresence(
+            DistantHorizonsPresencePayload payload,
+            IPayloadContext context
+    ) {
+        if (context.player() instanceof ServerPlayer serverPlayer) {
+            FalloutTerrainManager.setDistantHorizonsClient(
+                    serverPlayer,
+                    payload.installed()
+            );
+        }
+    }
+
+    private static void handleTerrainChunkLodRefreshComplete(
+            TerrainChunkLodRefreshCompletePayload payload,
+            IPayloadContext context
+    ) {
+        if (context.player() instanceof ServerPlayer serverPlayer) {
+            FalloutTerrainManager.acknowledgeDistantHorizonsRefresh(
+                    serverPlayer,
+                    payload.terrainEffectId(),
+                    payload.chunkX(),
+                    payload.chunkZ()
+            );
+        }
+    }
+
+    /** Client capability handshake used to enable slow DH background work. */
+    public record DistantHorizonsPresencePayload(
+            boolean installed
+    ) implements CustomPacketPayload {
+        public static final Type<DistantHorizonsPresencePayload> TYPE =
+                new Type<>(
+                        ResourceLocation.fromNamespaceAndPath(
+                                NucleoCraftDetonation.MOD_ID,
+                                "distant_horizons_presence"
+                        )
+                );
+
+        public static final StreamCodec<
+                RegistryFriendlyByteBuf,
+                DistantHorizonsPresencePayload
+                > STREAM_CODEC =
+                StreamCodec.composite(
+                        ByteBufCodecs.BOOL,
+                        DistantHorizonsPresencePayload::installed,
+                        DistantHorizonsPresencePayload::new
+                );
+
+        @Override
+        public Type<? extends CustomPacketPayload> type() {
+            return TYPE;
+        }
     }
 
     public record FalloutVisualPayload(
@@ -212,6 +297,83 @@ public final class DetonationNetwork {
         public CraterLodRefreshPayload {
             affectedRadius = Math.max(1, affectedRadius);
         }
+
+        @Override
+        public Type<? extends CustomPacketPayload> type() {
+            return TYPE;
+        }
+    }
+
+    /**
+     * Refreshes one exact chunk after the fallout terrain pass has finished
+     * changing it. This avoids clearing Distant Horizons' entire render cache.
+     */
+    public record TerrainChunkLodRefreshPayload(
+            long terrainEffectId,
+            int chunkX,
+            int chunkZ
+    ) implements CustomPacketPayload {
+        public static final Type<TerrainChunkLodRefreshPayload> TYPE =
+                new Type<>(
+                        ResourceLocation.fromNamespaceAndPath(
+                                NucleoCraftDetonation.MOD_ID,
+                                "refresh_terrain_chunk_lod"
+                        )
+                );
+
+        public static final StreamCodec<
+                RegistryFriendlyByteBuf,
+                TerrainChunkLodRefreshPayload
+                > STREAM_CODEC =
+                StreamCodec.composite(
+                        ByteBufCodecs.VAR_LONG,
+                        TerrainChunkLodRefreshPayload::terrainEffectId,
+
+                        ByteBufCodecs.VAR_INT,
+                        TerrainChunkLodRefreshPayload::chunkX,
+
+                        ByteBufCodecs.VAR_INT,
+                        TerrainChunkLodRefreshPayload::chunkZ,
+
+                        TerrainChunkLodRefreshPayload::new
+                );
+
+        @Override
+        public Type<? extends CustomPacketPayload> type() {
+            return TYPE;
+        }
+    }
+
+    /** Client acknowledgement after DH accepted the refreshed LevelChunk. */
+    public record TerrainChunkLodRefreshCompletePayload(
+            long terrainEffectId,
+            int chunkX,
+            int chunkZ
+    ) implements CustomPacketPayload {
+        public static final Type<TerrainChunkLodRefreshCompletePayload> TYPE =
+                new Type<>(
+                        ResourceLocation.fromNamespaceAndPath(
+                                NucleoCraftDetonation.MOD_ID,
+                                "terrain_chunk_lod_refresh_complete"
+                        )
+                );
+
+        public static final StreamCodec<
+                RegistryFriendlyByteBuf,
+                TerrainChunkLodRefreshCompletePayload
+                > STREAM_CODEC =
+                StreamCodec.composite(
+                        ByteBufCodecs.VAR_LONG,
+                        TerrainChunkLodRefreshCompletePayload::terrainEffectId,
+
+                        ByteBufCodecs.VAR_INT,
+                        TerrainChunkLodRefreshCompletePayload::chunkX,
+
+                        ByteBufCodecs.VAR_INT,
+                        TerrainChunkLodRefreshCompletePayload::chunkZ,
+
+                        TerrainChunkLodRefreshCompletePayload::new
+                );
 
         @Override
         public Type<? extends CustomPacketPayload> type() {

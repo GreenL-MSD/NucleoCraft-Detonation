@@ -1,45 +1,82 @@
 package com.github.loganmartingreen.nucleocraftdetonation.terrain;
 
+import com.github.loganmartingreen.nucleocraftdetonation.NucleoCraftDetonation;
 import com.github.loganmartingreen.nucleocraftdetonation.config.DetonationTuning;
+import com.github.loganmartingreen.nucleocraftdetonation.network.DetonationNetwork.TerrainChunkLodRefreshPayload;
 import com.github.loganmartingreen.nucleocraftdetonation.persistence.DetonationSavedData;
 import com.github.loganmartingreen.nucleocraftdetonation.persistence.DetonationSavedData.TerrainZone;
+import com.mojang.logging.LogUtils;
 
+import net.minecraft.core.BlockPos;
 import net.minecraft.resources.ResourceKey;
+import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.Mob;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.phys.AABB;
 
+import net.neoforged.neoforge.common.world.chunk.RegisterTicketControllersEvent;
+import net.neoforged.neoforge.common.world.chunk.TicketController;
 import net.neoforged.neoforge.event.level.ChunkEvent;
+import net.neoforged.neoforge.network.PacketDistributor;
+
+import org.slf4j.Logger;
 
 import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.PriorityQueue;
 import java.util.Set;
 import java.util.UUID;
 
 /**
- * Applies the permanent fallout terrain pass as a fast block-column wave.
+ * Persistent per-chunk scheduler for permanent fallout terrain conversion.
  *
- * <p>The initial loaded area is not processed one square chunk at a time.
- * Instead, loaded columns are ordered by their distance from ground zero and
- * processed from the crater rim outwards, matching the way the crater itself
- * visibly grows. Chunks loaded later receive the same v24 replacement pass as
- * a catch-up job.</p>
+ * <p>Every chunk intersecting the circular effect range is calculated once in
+ * exact nearest-first order. The saved completed set is subtracted from that
+ * deterministic target list, so all other targets are implicitly incomplete.
+ * Naturally loaded chunks are processed first. When a client with Distant
+ * Horizons is present, up to two incomplete chunks are temporarily staged in
+ * nearest-first order, processed, saved, released and marked for a later DH LOD
+ * rebuild when a player receives that chunk.</p>
  */
 public final class FalloutTerrainManager {
-    private static final Deque<ActiveWave> ACTIVE_WAVES = new ArrayDeque<>();
-    private static final Map<Long, ActiveWave> WAVES_BY_EFFECT = new HashMap<>();
-    private static final Deque<FalloutTerrainChunkTask> CHUNK_TASKS = new ArrayDeque<>();
-    private static final Set<ChunkJobKey> QUEUED_CHUNKS = new HashSet<>();
-    private static final Set<EntityEffectKey> AFFECTED_MOBS = new HashSet<>();
+    private static final Logger LOGGER = LogUtils.getLogger();
+    private static final long NO_CHUNK = Long.MIN_VALUE;
+
+    private static final TicketController TERRAIN_TICKET_CONTROLLER =
+            new TicketController(
+                    ResourceLocation.fromNamespaceAndPath(
+                            NucleoCraftDetonation.MOD_ID,
+                            "fallout_terrain"
+                    ),
+                    (level, ticketHelper) -> {
+                        /* Never persist temporary background-load tickets. */
+                        List<BlockPos> staleOwners = new ArrayList<>(
+                                ticketHelper.getBlockTickets().keySet()
+                        );
+                        staleOwners.forEach(ticketHelper::removeAllTickets);
+                    }
+            );
+
+    private static final Deque<TerrainScheduler> ACTIVE_SCHEDULERS =
+            new ArrayDeque<>();
+    private static final Map<Long, TerrainScheduler> SCHEDULERS_BY_EFFECT =
+            new HashMap<>();
+    private static final Set<UUID> DISTANT_HORIZONS_PLAYERS =
+            new HashSet<>();
+    private static final Set<EntityEffectKey> AFFECTED_MOBS =
+            new HashSet<>();
 
     private static MinecraftServer activeServer;
     private static int entityCheckCountdown;
@@ -47,17 +84,106 @@ public final class FalloutTerrainManager {
     private FalloutTerrainManager() {
     }
 
+    public static void registerTicketController(
+            RegisterTicketControllersEvent event
+    ) {
+        event.register(TERRAIN_TICKET_CONTROLLER);
+    }
+
+    /** Records whether this connected player can consume DH refresh work. */
+    public static void setDistantHorizonsClient(
+            ServerPlayer player,
+            boolean installed
+    ) {
+        if (installed) {
+            DISTANT_HORIZONS_PLAYERS.add(player.getUUID());
+
+            if (activeServer != null) {
+                ServerLevel level = player.serverLevel();
+                DetonationSavedData data = DetonationSavedData.get(
+                        level.getServer()
+                );
+                for (TerrainZone zone : data.terrainZonesFor(level.dimension())) {
+                    if (
+                            data.hasPendingTerrainLodRefreshes(zone.effectId())
+                                    && !SCHEDULERS_BY_EFFECT.containsKey(
+                                    zone.effectId()
+                            )
+                    ) {
+                        addScheduler(level, data, zone);
+                    }
+                }
+            }
+        } else {
+            DISTANT_HORIZONS_PLAYERS.remove(player.getUUID());
+        }
+    }
+
+    /** Clears the saved DH-pending bit only after the client submits the LOD. */
+    public static void acknowledgeDistantHorizonsRefresh(
+            ServerPlayer player,
+            long terrainEffectId,
+            int chunkX,
+            int chunkZ
+    ) {
+        DetonationSavedData data = DetonationSavedData.get(
+                player.serverLevel().getServer()
+        );
+        TerrainZone zone = data.terrainZoneById(terrainEffectId);
+        if (
+                zone == null
+                        || !zone.dimension().equals(
+                        player.serverLevel().dimension()
+                )
+        ) {
+            return;
+        }
+
+        long chunkLong = ChunkPos.asLong(chunkX, chunkZ);
+        if (data.isTerrainChunkProcessed(terrainEffectId, chunkLong)) {
+            data.clearTerrainChunkLodRefreshPending(
+                    terrainEffectId,
+                    chunkLong
+            );
+        }
+    }
+
+    /**
+     * The rim may start once all chunks close enough to touch the crater edge
+     * have completed. Distant fallout is intentionally allowed to continue
+     * after the final rim, because without DH those chunks wait for exploration.
+     */
+    public static boolean isRimSafetyAreaIncomplete(long terrainEffectId) {
+        TerrainScheduler scheduler = SCHEDULERS_BY_EFFECT.get(terrainEffectId);
+        if (scheduler == null || activeServer == null) {
+            return false;
+        }
+
+        DetonationSavedData data = DetonationSavedData.get(activeServer);
+        return !scheduler.isRimSafetyAreaComplete(data);
+    }
+
     public static void clear() {
-        ACTIVE_WAVES.clear();
-        WAVES_BY_EFFECT.clear();
-        CHUNK_TASKS.clear();
-        QUEUED_CHUNKS.clear();
+        if (activeServer != null) {
+            for (TerrainScheduler scheduler : ACTIVE_SCHEDULERS) {
+                ServerLevel level = activeServer.getLevel(
+                        scheduler.zone.dimension()
+                );
+                if (level != null) {
+                    scheduler.releaseForcedChunks(level);
+                }
+            }
+        }
+
+        ACTIVE_SCHEDULERS.clear();
+        SCHEDULERS_BY_EFFECT.clear();
+        DISTANT_HORIZONS_PLAYERS.clear();
         AFFECTED_MOBS.clear();
         entityCheckCountdown = 0;
         activeServer = null;
     }
 
-    /** Starts the fast radial pass immediately after crater excavation. */
+    /** Starts or rebuilds the scheduler after crater excavation. */
     public static void startInitialSweep(
             ServerLevel level,
             long terrainEffectId
@@ -68,16 +194,14 @@ public final class FalloutTerrainManager {
             return;
         }
 
-        removeWave(terrainEffectId);
-        ActiveWave wave = new ActiveWave(zone);
-        wave.seedLoadedChunks(level, data);
-        ACTIVE_WAVES.addLast(wave);
-        WAVES_BY_EFFECT.put(terrainEffectId, wave);
+        removeScheduler(terrainEffectId, level);
+        addScheduler(level, data, zone);
     }
 
     /**
-     * Newly loaded chunks are added to an active wave. Once a wave has
-     * completed, the chunk receives an immediate catch-up pass.
+     * Natural chunk loading is the primary trigger when DH background loading
+     * is unavailable. No incomplete chunk is discarded merely because it later
+     * unloads; its in-progress task is retained and resumed on the next load.
      */
     public static void onChunkLoad(ChunkEvent.Load event) {
         if (!(event.getLevel() instanceof ServerLevel level)) {
@@ -89,16 +213,41 @@ public final class FalloutTerrainManager {
 
         DetonationSavedData data = DetonationSavedData.get(level.getServer());
         for (TerrainZone zone : data.terrainZonesFor(level.dimension())) {
-            if (!chunkIntersectsZone(chunk.getPos(), zone)) {
+            ChunkPos chunkPos = chunk.getPos();
+            if (!chunkIntersectsZone(chunkPos, zone)) {
                 continue;
             }
 
-            ActiveWave wave = WAVES_BY_EFFECT.get(zone.effectId());
-            if (wave != null) {
-                wave.addChunk(level, data, chunk.getPos());
-            } else {
-                queueChunk(level, zone, chunk.getPos());
+            long chunkLong = chunkPos.toLong();
+            if (data.isTerrainChunkProcessed(zone.effectId(), chunkLong)) {
+                /*
+                 * A correct vanilla chunk has now reached the normal load path.
+                 * Keep the saved pending bit until a DH client acknowledges that
+                 * overwriteChunkDataAsync accepted the refreshed LevelChunk.
+                 */
+                if (
+                        data.isTerrainChunkLodRefreshPending(
+                                zone.effectId(),
+                                chunkLong
+                        )
+                                && hasDistantHorizonsPlayer(level)
+                ) {
+                    notifyTerrainChunkUpdated(
+                            level,
+                            zone.effectId(),
+                            chunkPos
+                    );
+                }
+                continue;
             }
+
+            TerrainScheduler scheduler = SCHEDULERS_BY_EFFECT.get(
+                    zone.effectId()
+            );
+            if (scheduler == null) {
+                scheduler = addScheduler(level, data, zone);
+            }
+            scheduler.onChunkLoaded(level, data, chunkPos);
         }
     }
 
@@ -110,117 +259,134 @@ public final class FalloutTerrainManager {
             DetonationSavedData data = DetonationSavedData.get(server);
             for (ServerLevel level : server.getAllLevels()) {
                 for (TerrainZone zone : data.terrainZonesFor(level.dimension())) {
-                    ActiveWave wave = new ActiveWave(zone);
-                    wave.seedLoadedChunks(level, data);
-                    ACTIVE_WAVES.addLast(wave);
-                    WAVES_BY_EFFECT.put(zone.effectId(), wave);
+                    if (!data.isTerrainComplete(zone.effectId())) {
+                        addScheduler(level, data, zone);
+                    }
                 }
             }
         }
 
-        processWaves(server);
-        processChunkTasks(server);
+        processSchedulers(server);
 
         entityCheckCountdown--;
         if (entityCheckCountdown <= 0) {
-            entityCheckCountdown = DetonationTuning.FalloutTerrain.ENTITY_CHECK_INTERVAL_TICKS;
+            entityCheckCountdown =
+                    DetonationTuning.FalloutTerrain.ENTITY_CHECK_INTERVAL_TICKS;
             affectReachedMobs(server);
         }
     }
 
-    private static void processWaves(MinecraftServer server) {
+    private static TerrainScheduler addScheduler(
+            ServerLevel level,
+            DetonationSavedData data,
+            TerrainZone zone
+    ) {
+        TerrainScheduler existing = SCHEDULERS_BY_EFFECT.get(zone.effectId());
+        if (existing != null) {
+            return existing;
+        }
+
+        TerrainScheduler scheduler = new TerrainScheduler(zone, data);
+        ACTIVE_SCHEDULERS.addLast(scheduler);
+        SCHEDULERS_BY_EFFECT.put(zone.effectId(), scheduler);
+        if (!data.isTerrainComplete(zone.effectId())) {
+            scheduler.discoverLoadedChunks(level, data, Integer.MAX_VALUE);
+        }
+        return scheduler;
+    }
+
+    private static void removeScheduler(
+            long effectId,
+            ServerLevel level
+    ) {
+        TerrainScheduler existing = SCHEDULERS_BY_EFFECT.remove(effectId);
+        if (existing == null) {
+            return;
+        }
+
+        existing.releaseForcedChunks(level);
+        ACTIVE_SCHEDULERS.remove(existing);
+    }
+
+    private static void processSchedulers(MinecraftServer server) {
         int budget = DetonationTuning.FalloutTerrain.BLOCK_CHECKS_PER_TICK;
         DetonationSavedData data = DetonationSavedData.get(server);
-        int wavesToVisit = ACTIVE_WAVES.size();
+        int schedulersToVisit = ACTIVE_SCHEDULERS.size();
+        int activeBackgroundLoads = 0;
+        for (TerrainScheduler scheduler : ACTIVE_SCHEDULERS) {
+            activeBackgroundLoads += scheduler.forcedChunkCount();
+        }
 
-        while (budget > 0 && wavesToVisit-- > 0 && !ACTIVE_WAVES.isEmpty()) {
-            ActiveWave wave = ACTIVE_WAVES.removeFirst();
-            ServerLevel level = server.getLevel(wave.zone.dimension());
+        while (
+                budget > 0
+                        && schedulersToVisit-- > 0
+                        && !ACTIVE_SCHEDULERS.isEmpty()
+        ) {
+            TerrainScheduler scheduler = ACTIVE_SCHEDULERS.removeFirst();
+            ServerLevel level = server.getLevel(scheduler.zone.dimension());
 
             if (level == null) {
-                WAVES_BY_EFFECT.remove(wave.zone.effectId());
+                SCHEDULERS_BY_EFFECT.remove(scheduler.zone.effectId());
                 continue;
             }
 
-            ActiveWave.StepResult result = wave.tick(level, data, budget);
+            int heldBackgroundTickets = scheduler.forcedChunkCount();
+            int availableBackgroundSlots = Math.max(
+                    0,
+                    DetonationTuning.FalloutTerrain
+                            .BACKGROUND_GLOBAL_FORCE_LOAD_LIMIT
+                            - activeBackgroundLoads
+            );
+            TerrainScheduler.StepResult result = scheduler.tick(
+                    level,
+                    data,
+                    budget,
+                    hasDistantHorizonsPlayer(level),
+                    availableBackgroundSlots
+            );
+            activeBackgroundLoads +=
+                    scheduler.forcedChunkCount() - heldBackgroundTickets;
             budget -= Math.max(1, result.blockChecks());
 
             if (result.complete()) {
-                WAVES_BY_EFFECT.remove(wave.zone.effectId());
+                scheduler.releaseForcedChunks(level);
+                SCHEDULERS_BY_EFFECT.remove(scheduler.zone.effectId());
             } else {
-                ACTIVE_WAVES.addLast(wave);
+                ACTIVE_SCHEDULERS.addLast(scheduler);
             }
+        }
+
+        /* Rotate the first scheduler so low remaining budget cannot starve later detonations. */
+        if (ACTIVE_SCHEDULERS.size() > 1) {
+            ACTIVE_SCHEDULERS.addLast(ACTIVE_SCHEDULERS.removeFirst());
         }
     }
 
-    private static void processChunkTasks(MinecraftServer server) {
-        int budget = DetonationTuning.FalloutTerrain.CATCH_UP_BLOCK_CHECKS_PER_TICK;
-        DetonationSavedData data = DetonationSavedData.get(server);
-
-        while (budget > 0 && !CHUNK_TASKS.isEmpty()) {
-            FalloutTerrainChunkTask task = CHUNK_TASKS.peekFirst();
-            ServerLevel level = server.getLevel(task.zone().dimension());
-
-            if (
-                    level == null
-                            || !level.hasChunk(task.chunkPos().x, task.chunkPos().z)
-            ) {
-                removeFirstTask(task);
-                continue;
-            }
-
-            FalloutTerrainChunkTask.StepResult result = task.tick(level, budget);
-            budget -= Math.max(1, result.blockChecks());
-
-            if (result.complete()) {
-                data.markTerrainChunkProcessed(
-                        task.zone().effectId(),
-                        task.chunkPos().toLong()
-                );
-                removeFirstTask(task);
+    private static boolean hasDistantHorizonsPlayer(ServerLevel level) {
+        for (ServerPlayer player : level.players()) {
+            if (DISTANT_HORIZONS_PLAYERS.contains(player.getUUID())) {
+                return true;
             }
         }
+        return false;
     }
 
-    private static void queueChunk(
+    private static void notifyTerrainChunkUpdated(
             ServerLevel level,
-            TerrainZone zone,
+            long terrainEffectId,
             ChunkPos chunkPos
     ) {
-        DetonationSavedData data = DetonationSavedData.get(level.getServer());
-        long chunkLong = chunkPos.toLong();
+        TerrainChunkLodRefreshPayload payload =
+                new TerrainChunkLodRefreshPayload(
+                        terrainEffectId,
+                        chunkPos.x,
+                        chunkPos.z
+                );
 
-        if (data.isTerrainChunkProcessed(zone.effectId(), chunkLong)) {
-            return;
-        }
-
-        ChunkJobKey key = new ChunkJobKey(
-                zone.dimension(),
-                zone.effectId(),
-                chunkLong
-        );
-        if (!QUEUED_CHUNKS.add(key)) {
-            return;
-        }
-
-        CHUNK_TASKS.addLast(new FalloutTerrainChunkTask(zone, chunkPos));
-    }
-
-    private static void removeFirstTask(FalloutTerrainChunkTask task) {
-        CHUNK_TASKS.removeFirst();
-        QUEUED_CHUNKS.remove(
-                new ChunkJobKey(
-                        task.zone().dimension(),
-                        task.zone().effectId(),
-                        task.chunkPos().toLong()
-                )
-        );
-    }
-
-    private static void removeWave(long effectId) {
-        ActiveWave existing = WAVES_BY_EFFECT.remove(effectId);
-        if (existing != null) {
-            ACTIVE_WAVES.remove(existing);
+        for (ServerPlayer player : level.players()) {
+            if (DISTANT_HORIZONS_PLAYERS.contains(player.getUUID())) {
+                PacketDistributor.sendToPlayer(player, payload);
+            }
         }
     }
 
@@ -229,10 +395,12 @@ public final class FalloutTerrainManager {
 
         for (ServerLevel level : server.getAllLevels()) {
             for (TerrainZone zone : data.terrainZonesFor(level.dimension())) {
-                ActiveWave wave = WAVES_BY_EFFECT.get(zone.effectId());
-                double reachedRadius = wave == null
+                TerrainScheduler scheduler = SCHEDULERS_BY_EFFECT.get(
+                        zone.effectId()
+                );
+                double reachedRadius = scheduler == null
                         ? zone.falloutRadius()
-                        : wave.currentRadius();
+                        : scheduler.currentRadius();
 
                 if (reachedRadius <= 0.0D) {
                     continue;
@@ -255,7 +423,10 @@ public final class FalloutTerrainManager {
                     double dx = mob.getX() - zone.centre().getX();
                     double dz = mob.getZ() - zone.centre().getZ();
                     double distance = Math.sqrt(dx * dx + dz * dz);
-                    if (distance > reachedRadius || distance > zone.falloutRadius()) {
+                    if (
+                            distance > reachedRadius
+                                    || distance > zone.falloutRadius()
+                    ) {
                         continue;
                     }
 
@@ -279,31 +450,47 @@ public final class FalloutTerrainManager {
             Mob mob,
             double distanceRatio
     ) {
-        if (distanceRatio <= DetonationTuning.FalloutTerrain.ENTITY_KILL_DISTANCE_RATIO) {
+        if (
+                distanceRatio
+                        <= DetonationTuning.FalloutTerrain
+                        .ENTITY_KILL_DISTANCE_RATIO
+        ) {
             mob.hurt(level.damageSources().explosion(null, null), Float.MAX_VALUE);
             return;
         }
 
-        if (distanceRatio <= DetonationTuning.FalloutTerrain.ENTITY_HEAVY_DAMAGE_DISTANCE_RATIO) {
-            mob.igniteForSeconds(DetonationTuning.FalloutTerrain.ENTITY_HEAVY_FIRE_SECONDS);
+        if (
+                distanceRatio
+                        <= DetonationTuning.FalloutTerrain
+                        .ENTITY_HEAVY_DAMAGE_DISTANCE_RATIO
+        ) {
+            mob.igniteForSeconds(
+                    DetonationTuning.FalloutTerrain.ENTITY_HEAVY_FIRE_SECONDS
+            );
             mob.hurt(
                     level.damageSources().explosion(null, null),
                     Math.max(
-                            DetonationTuning.FalloutTerrain.ENTITY_HEAVY_DAMAGE_MINIMUM,
+                            DetonationTuning.FalloutTerrain
+                                    .ENTITY_HEAVY_DAMAGE_MINIMUM,
                             mob.getMaxHealth()
-                                    * DetonationTuning.FalloutTerrain.ENTITY_HEAVY_DAMAGE_FRACTION
+                                    * DetonationTuning.FalloutTerrain
+                                    .ENTITY_HEAVY_DAMAGE_FRACTION
                     )
             );
             return;
         }
 
-        mob.igniteForSeconds(DetonationTuning.FalloutTerrain.ENTITY_OUTER_FIRE_SECONDS);
+        mob.igniteForSeconds(
+                DetonationTuning.FalloutTerrain.ENTITY_OUTER_FIRE_SECONDS
+        );
         mob.hurt(
                 level.damageSources().explosion(null, null),
                 Math.max(
-                        DetonationTuning.FalloutTerrain.ENTITY_OUTER_DAMAGE_MINIMUM,
+                        DetonationTuning.FalloutTerrain
+                                .ENTITY_OUTER_DAMAGE_MINIMUM,
                         mob.getMaxHealth()
-                                * DetonationTuning.FalloutTerrain.ENTITY_OUTER_DAMAGE_FRACTION
+                                * DetonationTuning.FalloutTerrain
+                                .ENTITY_OUTER_DAMAGE_FRACTION
                 )
         );
     }
@@ -328,22 +515,86 @@ public final class FalloutTerrainManager {
                 <= zone.falloutRadius() * zone.falloutRadius();
     }
 
-    private static long packColumn(int x, int z) {
-        return (x & 0xFFFFFFFFL) | ((long) z << 32);
+    private static double chunkDistanceSquared(
+            ChunkPos chunkPos,
+            TerrainZone zone
+    ) {
+        double x = chunkPos.getMinBlockX() + 8.0D;
+        double z = chunkPos.getMinBlockZ() + 8.0D;
+        double dx = x - zone.centre().getX();
+        double dz = z - zone.centre().getZ();
+        return dx * dx + dz * dz;
     }
 
-    private static int unpackX(long packed) {
-        return (int) packed;
+    /**
+     * Builds a compact primitive array containing every intersecting chunk in
+     * true nearest-first order. The temporary sort keys consume about 8 MB at
+     * the maximum 8,000-block fallout radius, rather than hundreds of thousands
+     * of Java queue objects.
+     */
+    private static ChunkTargetPlan buildOrderedChunkTargets(TerrainZone zone) {
+        int radius = (int) Math.ceil(zone.falloutRadius());
+        int minimumChunkX = Math.floorDiv(zone.centre().getX() - radius, 16) - 1;
+        int maximumChunkX = Math.floorDiv(zone.centre().getX() + radius, 16) + 1;
+        int minimumChunkZ = Math.floorDiv(zone.centre().getZ() - radius, 16) - 1;
+        int maximumChunkZ = Math.floorDiv(zone.centre().getZ() + radius, 16) + 1;
+
+        int width = maximumChunkX - minimumChunkX + 1;
+        int depth = maximumChunkZ - minimumChunkZ + 1;
+        long[] sortKeys = new long[Math.multiplyExact(width, depth)];
+        int count = 0;
+
+        int centreChunkX = zone.centre().getX() >> 4;
+        int centreChunkZ = zone.centre().getZ() >> 4;
+
+        for (int chunkX = minimumChunkX; chunkX <= maximumChunkX; chunkX++) {
+            for (int chunkZ = minimumChunkZ; chunkZ <= maximumChunkZ; chunkZ++) {
+                ChunkPos chunkPos = new ChunkPos(chunkX, chunkZ);
+                if (!chunkIntersectsZone(chunkPos, zone)) {
+                    continue;
+                }
+
+                int offsetX = chunkX - centreChunkX;
+                int offsetZ = chunkZ - centreChunkZ;
+                long distanceSquared = Math.round(
+                        chunkDistanceSquared(chunkPos, zone)
+                );
+
+                long packedOffsets =
+                        ((long) offsetX & 0xFFFFL) << 16
+                                | ((long) offsetZ & 0xFFFFL);
+                sortKeys[count++] = distanceSquared << 32 | packedOffsets;
+            }
+        }
+
+        Arrays.sort(sortKeys, 0, count);
+        long[] orderedChunks = new long[count];
+
+        for (int index = 0; index < count; index++) {
+            long key = sortKeys[index];
+            int offsetX = (short) ((key >>> 16) & 0xFFFFL);
+            int offsetZ = (short) (key & 0xFFFFL);
+            orderedChunks[index] = ChunkPos.asLong(
+                    centreChunkX + offsetX,
+                    centreChunkZ + offsetZ
+            );
+        }
+
+        return new ChunkTargetPlan(
+                orderedChunks,
+                minimumChunkX,
+                minimumChunkZ,
+                width,
+                depth
+        );
     }
 
-    private static int unpackZ(long packed) {
-        return (int) (packed >>> 32);
-    }
-
-    private record ChunkJobKey(
-            ResourceKey<Level> dimension,
-            long effectId,
-            long chunkPos
+    private record ChunkTargetPlan(
+            long[] orderedChunks,
+            int minimumChunkX,
+            int minimumChunkZ,
+            int width,
+            int depth
     ) {
     }
 
@@ -354,64 +605,134 @@ public final class FalloutTerrainManager {
     ) {
     }
 
-    private record ColumnEntry(
-            long packedColumn,
-            double distanceSquared,
-            long chunkLong
+    private record ReadyChunk(
+            long chunkLong,
+            double distanceSquared
     ) {
     }
 
-    private static final class ActiveWave {
+    private static final class TerrainScheduler {
         private final TerrainZone zone;
-        private final PriorityQueue<ColumnEntry> columns;
-        private final Set<Long> queuedColumns = new HashSet<>();
-        private final Map<Long, Integer> remainingColumnsByChunk = new HashMap<>();
+        private final long[] orderedChunks;
+        private final long[] rimSafetyChunks;
+        private final PriorityQueue<ReadyChunk> readyChunks =
+                new PriorityQueue<>(
+                        Comparator.comparingDouble(ReadyChunk::distanceSquared)
+                                .thenComparingLong(ReadyChunk::chunkLong)
+                );
+        private final Set<Long> queuedChunks = new HashSet<>();
+        private final Map<Long, FalloutTerrainChunkTask> pausedTasks =
+                new HashMap<>();
 
-        private FalloutTerrainChunkTask activeColumnTask;
-        private ColumnEntry activeColumnEntry;
+        private final double rimSafetyRadiusSquared;
+        private int discoveryCursor;
+        private int backgroundCursor;
+        private int completedTargetChunks;
+        private int incompleteRimSafetyChunks;
+        private int progressLogCountdown;
+        private int backgroundCooldown;
+        private int lodDiscoveryCursor;
+        private boolean distantHorizonsPreviouslyAvailable;
+
+        private FalloutTerrainChunkTask activeTask;
+        private long activeChunk = NO_CHUNK;
+        private boolean activeForced;
+
+        private final Map<Long, BackgroundChunk> forcedChunks =
+                new HashMap<>();
+
         private double currentRadius;
 
-        private ActiveWave(TerrainZone zone) {
-            this.zone = zone;
-            double craterRadiusSquared = zone.visualScale() * zone.visualScale();
-            this.columns = new PriorityQueue<>(
-                    Comparator.comparingDouble(entry ->
-                            entry.distanceSquared() <= craterRadiusSquared
-                                    ? -1.0D
-                                    : entry.distanceSquared()
-                    )
-            );
-            this.currentRadius = zone.visualScale();
-        }
-
-        private void seedLoadedChunks(
-                ServerLevel level,
+        private TerrainScheduler(
+                TerrainZone zone,
                 DetonationSavedData data
         ) {
-            int minimumChunkX = (int) Math.floor(
-                    (zone.centre().getX() - zone.falloutRadius()) / 16.0D
+            this.zone = zone;
+            ChunkTargetPlan targetPlan = buildOrderedChunkTargets(zone);
+            this.orderedChunks = targetPlan.orderedChunks();
+            data.configureTerrainChunkGrid(
+                    zone.effectId(),
+                    targetPlan.minimumChunkX(),
+                    targetPlan.minimumChunkZ(),
+                    targetPlan.width(),
+                    targetPlan.depth(),
+                    orderedChunks
             );
-            int maximumChunkX = (int) Math.floor(
-                    (zone.centre().getX() + zone.falloutRadius()) / 16.0D
+            this.currentRadius = zone.visualScale();
+            this.progressLogCountdown =
+                    DetonationTuning.FalloutTerrain.PROGRESS_LOG_INTERVAL_TICKS;
+
+            double rimSafetyRadius = Math.min(
+                    zone.falloutRadius(),
+                    zone.visualScale()
+                            * DetonationTuning.FalloutTerrain
+                            .RIM_SAFETY_RADIUS_MULTIPLIER
+                            + DetonationTuning.FalloutTerrain
+                            .RIM_SAFETY_PADDING_BLOCKS
             );
-            int minimumChunkZ = (int) Math.floor(
-                    (zone.centre().getZ() - zone.falloutRadius()) / 16.0D
-            );
-            int maximumChunkZ = (int) Math.floor(
-                    (zone.centre().getZ() + zone.falloutRadius()) / 16.0D
+            this.rimSafetyRadiusSquared = rimSafetyRadius * rimSafetyRadius;
+
+            long[] rimSafetyBuffer = new long[orderedChunks.length];
+            int rimSafetyCount = 0;
+            for (long chunkLong : orderedChunks) {
+                if (isRimSafetyChunk(chunkLong)) {
+                    rimSafetyBuffer[rimSafetyCount++] = chunkLong;
+                }
+
+                if (data.isTerrainChunkProcessed(zone.effectId(), chunkLong)) {
+                    completedTargetChunks++;
+                }
+            }
+            this.rimSafetyChunks = Arrays.copyOf(
+                    rimSafetyBuffer,
+                    rimSafetyCount
             );
 
-            for (int chunkX = minimumChunkX; chunkX <= maximumChunkX; chunkX++) {
-                for (int chunkZ = minimumChunkZ; chunkZ <= maximumChunkZ; chunkZ++) {
-                    if (level.hasChunk(chunkX, chunkZ)) {
-                        addChunk(level, data, new ChunkPos(chunkX, chunkZ));
-                    }
+            for (long chunkLong : rimSafetyChunks) {
+                if (!data.isTerrainChunkProcessed(zone.effectId(), chunkLong)) {
+                    incompleteRimSafetyChunks++;
+                }
+            }
+
+        }
+
+        private void onChunkLoaded(
+                ServerLevel level,
+                DetonationSavedData data,
+                ChunkPos chunkPos
+        ) {
+            enqueueLoadedChunk(data, chunkPos);
+        }
+
+        private void discoverLoadedChunks(
+                ServerLevel level,
+                DetonationSavedData data,
+                int requestedLimit
+        ) {
+            int limit = Math.min(
+                    requestedLimit,
+                    DetonationTuning.FalloutTerrain
+                            .LOADED_DISCOVERY_CHUNKS_PER_TICK
+            );
+            int inspected = 0;
+
+            while (
+                    discoveryCursor < orderedChunks.length
+                            && inspected++ < limit
+            ) {
+                long chunkLong = orderedChunks[discoveryCursor++];
+                if (data.isTerrainChunkProcessed(zone.effectId(), chunkLong)) {
+                    continue;
+                }
+
+                ChunkPos chunkPos = new ChunkPos(chunkLong);
+                if (level.hasChunk(chunkPos.x, chunkPos.z)) {
+                    enqueueLoadedChunk(data, chunkPos);
                 }
             }
         }
 
-        private void addChunk(
-                ServerLevel level,
+        private void enqueueLoadedChunk(
                 DetonationSavedData data,
                 ChunkPos chunkPos
         ) {
@@ -419,109 +740,487 @@ public final class FalloutTerrainManager {
             if (data.isTerrainChunkProcessed(zone.effectId(), chunkLong)) {
                 return;
             }
-            if (!chunkIntersectsZone(chunkPos, zone)) {
+            if (chunkLong == activeChunk || !queuedChunks.add(chunkLong)) {
                 return;
             }
 
-            int added = 0;
-            double maximumDistanceSquared = zone.falloutRadius() * zone.falloutRadius();
-
-            for (int localX = 0; localX < 16; localX++) {
-                int worldX = chunkPos.getMinBlockX() + localX;
-                for (int localZ = 0; localZ < 16; localZ++) {
-                    int worldZ = chunkPos.getMinBlockZ() + localZ;
-                    double dx = worldX + 0.5D - zone.centre().getX();
-                    double dz = worldZ + 0.5D - zone.centre().getZ();
-                    double distanceSquared = dx * dx + dz * dz;
-                    if (distanceSquared > maximumDistanceSquared) {
-                        continue;
-                    }
-
-                    long packed = packColumn(worldX, worldZ);
-                    if (!queuedColumns.add(packed)) {
-                        continue;
-                    }
-
-                    columns.add(new ColumnEntry(packed, distanceSquared, chunkLong));
-                    added++;
-                }
-            }
-
-            if (added > 0) {
-                remainingColumnsByChunk.merge(chunkLong, added, Integer::sum);
-            }
+            readyChunks.add(
+                    new ReadyChunk(
+                            chunkLong,
+                            chunkDistanceSquared(chunkPos, zone)
+                    )
+            );
         }
 
         private StepResult tick(
                 ServerLevel level,
                 DetonationSavedData data,
-                int maximumBlockChecks
+                int maximumBlockChecks,
+                boolean distantHorizonsAvailable,
+                int availableBackgroundSlots
         ) {
-            int checks = 0;
+            if (completedTargetChunks < orderedChunks.length) {
+                discoverLoadedChunks(
+                        level,
+                        data,
+                        DetonationTuning.FalloutTerrain
+                                .LOADED_DISCOVERY_CHUNKS_PER_TICK
+                );
+                maintainBackgroundChunks(
+                        level,
+                        data,
+                        distantHorizonsAvailable,
+                        availableBackgroundSlots
+                );
+            } else {
+                releaseForcedChunks(level);
+            }
+            discoverLoadedPendingLodChunks(
+                    level,
+                    data,
+                    distantHorizonsAvailable
+            );
 
+            int checks = 0;
             while (checks < maximumBlockChecks) {
-                if (activeColumnTask == null) {
-                    activeColumnEntry = columns.poll();
-                    if (activeColumnEntry == null) {
+                if (activeTask == null) {
+                    int remainingChecks = maximumBlockChecks - checks;
+                    int atomicChunkChecks = maximumChunkBlockChecks(level);
+                    if (
+                            atomicChunkChecks
+                                    <= DetonationTuning.FalloutTerrain
+                                    .BLOCK_CHECKS_PER_TICK
+                                    && remainingChecks < atomicChunkChecks
+                    ) {
+                        /* Start whole chunks only when this tick can finish them. */
                         break;
                     }
 
-                    int x = unpackX(activeColumnEntry.packedColumn());
-                    int z = unpackZ(activeColumnEntry.packedColumn());
-                    ChunkPos chunkPos = new ChunkPos(x >> 4, z >> 4);
-
-                    if (!level.hasChunk(chunkPos.x, chunkPos.z)) {
-                        finishColumn(data, activeColumnEntry);
-                        activeColumnEntry = null;
-                        continue;
+                    if (!startNextLoadedTask(level, data)) {
+                        break;
                     }
-
-                    currentRadius = Math.max(
-                            currentRadius,
-                            Math.sqrt(activeColumnEntry.distanceSquared())
-                    );
-                    activeColumnTask = new FalloutTerrainChunkTask(zone, x, z);
                 }
 
-                FalloutTerrainChunkTask.StepResult result = activeColumnTask.tick(
+                ChunkPos chunkPos = new ChunkPos(activeChunk);
+                if (!level.hasChunk(chunkPos.x, chunkPos.z)) {
+                    if (activeForced) {
+                        /* The temporary ticket should recover this next tick. */
+                        break;
+                    }
+
+                    pausedTasks.put(activeChunk, activeTask);
+                    clearActiveTask();
+                    continue;
+                }
+
+                FalloutTerrainChunkTask.StepResult result = activeTask.tick(
                         level,
                         maximumBlockChecks - checks
                 );
                 checks += Math.max(1, result.blockChecks());
 
                 if (result.complete()) {
-                    finishColumn(data, activeColumnEntry);
-                    activeColumnTask = null;
-                    activeColumnEntry = null;
+                    finishActiveChunk(level, data);
                 }
             }
 
-            return new StepResult(checks, columns.isEmpty() && activeColumnTask == null);
+            tickProgressLog();
+            boolean terrainComplete =
+                    completedTargetChunks >= orderedChunks.length;
+            boolean sessionLodScanComplete =
+                    !distantHorizonsAvailable
+                            || lodDiscoveryCursor >= orderedChunks.length;
+            return new StepResult(
+                    checks,
+                    terrainComplete && sessionLodScanComplete
+            );
         }
 
-        private void finishColumn(
-                DetonationSavedData data,
-                ColumnEntry entry
+        private static int maximumChunkBlockChecks(ServerLevel level) {
+            long worldHeight = Math.max(
+                    1L,
+                    (long) level.getMaxBuildHeight()
+                            - level.getMinBuildHeight()
+            );
+            return (int) Math.min(
+                    Integer.MAX_VALUE,
+                    worldHeight * 16L * 16L
+            );
+        }
+
+        private boolean startNextLoadedTask(
+                ServerLevel level,
+                DetonationSavedData data
         ) {
-            if (entry == null) {
+            while (!readyChunks.isEmpty()) {
+                ReadyChunk ready = readyChunks.poll();
+                queuedChunks.remove(ready.chunkLong());
+
+                if (
+                        data.isTerrainChunkProcessed(
+                                zone.effectId(),
+                                ready.chunkLong()
+                        )
+                ) {
+                    continue;
+                }
+
+                ChunkPos chunkPos = new ChunkPos(ready.chunkLong());
+                if (!level.hasChunk(chunkPos.x, chunkPos.z)) {
+                    /* Remains incomplete; onChunkLoad or DH will enqueue it. */
+                    continue;
+                }
+
+                activeChunk = ready.chunkLong();
+                activeForced = forcedChunks.containsKey(ready.chunkLong());
+                activeTask = pausedTasks.remove(activeChunk);
+                if (activeTask == null) {
+                    activeTask = new FalloutTerrainChunkTask(zone, chunkPos);
+                }
+                return true;
+            }
+
+            return false;
+        }
+
+        private void finishActiveChunk(
+                ServerLevel level,
+                DetonationSavedData data
+        ) {
+            long completedChunk = activeChunk;
+            boolean completedByBackgroundLoader = activeForced;
+            ChunkPos chunkPos = new ChunkPos(completedChunk);
+
+            if (
+                    data.markTerrainChunkProcessed(
+                            zone.effectId(),
+                            completedChunk
+                    )
+            ) {
+                completedTargetChunks++;
+                if (isRimSafetyChunk(completedChunk)) {
+                    incompleteRimSafetyChunks = Math.max(
+                            0,
+                            incompleteRimSafetyChunks - 1
+                    );
+                }
+            }
+
+            data.markTerrainChunkLodRefreshPending(
+                    zone.effectId(),
+                    completedChunk
+            );
+
+            currentRadius = Math.max(
+                    currentRadius,
+                    Math.sqrt(chunkDistanceSquared(chunkPos, zone)) + 12.0D
+            );
+
+            clearActiveTask();
+
+            if (forcedChunks.containsKey(completedChunk)) {
+                finishForcedChunk(level, data, completedChunk);
+            }
+
+            if (completedByBackgroundLoader) {
+                /*
+                 * Keep the DH-pending marker. A later natural chunk load sends
+                 * the refresh only when the client can actually receive it.
+                 */
                 return;
             }
 
-            Integer remaining = remainingColumnsByChunk.get(entry.chunkLong());
-            if (remaining == null) {
+            if (hasDistantHorizonsPlayer(level)) {
+                notifyTerrainChunkUpdated(
+                        level,
+                        zone.effectId(),
+                        chunkPos
+                );
+            }
+        }
+
+        private void discoverLoadedPendingLodChunks(
+                ServerLevel level,
+                DetonationSavedData data,
+                boolean distantHorizonsAvailable
+        ) {
+            if (!distantHorizonsAvailable) {
+                distantHorizonsPreviouslyAvailable = false;
                 return;
             }
 
-            if (remaining <= 1) {
-                remainingColumnsByChunk.remove(entry.chunkLong());
-                data.markTerrainChunkProcessed(zone.effectId(), entry.chunkLong());
-            } else {
-                remainingColumnsByChunk.put(entry.chunkLong(), remaining - 1);
+            if (!distantHorizonsPreviouslyAvailable) {
+                lodDiscoveryCursor = 0;
+                distantHorizonsPreviouslyAvailable = true;
             }
+
+            int inspected = 0;
+            while (
+                    lodDiscoveryCursor < orderedChunks.length
+                            && inspected++
+                            < DetonationTuning.FalloutTerrain
+                            .LOADED_DISCOVERY_CHUNKS_PER_TICK
+            ) {
+                long chunkLong = orderedChunks[lodDiscoveryCursor++];
+                if (
+                        !data.isTerrainChunkLodRefreshPending(
+                                zone.effectId(),
+                                chunkLong
+                        )
+                ) {
+                    continue;
+                }
+
+                ChunkPos chunkPos = new ChunkPos(chunkLong);
+                if (level.hasChunk(chunkPos.x, chunkPos.z)) {
+                    notifyTerrainChunkUpdated(
+                            level,
+                            zone.effectId(),
+                            chunkPos
+                    );
+                }
+            }
+        }
+
+        private void maintainBackgroundChunks(
+                ServerLevel level,
+                DetonationSavedData data,
+                boolean distantHorizonsAvailable,
+                int availableBackgroundSlots
+        ) {
+            if (backgroundCooldown > 0) {
+                backgroundCooldown--;
+            }
+
+            if (!distantHorizonsAvailable) {
+                for (long chunkLong : new ArrayList<>(forcedChunks.keySet())) {
+                    if (activeChunk != chunkLong) {
+                        releaseForcedChunk(level, chunkLong);
+                    }
+                }
+                return;
+            }
+
+            for (long chunkLong : new ArrayList<>(forcedChunks.keySet())) {
+                BackgroundChunk backgroundChunk = forcedChunks.get(chunkLong);
+                if (backgroundChunk == null) {
+                    continue;
+                }
+
+                if (data.isTerrainChunkProcessed(zone.effectId(), chunkLong)) {
+                    finishForcedChunk(level, data, chunkLong);
+                    continue;
+                }
+
+                ChunkPos chunkPos = new ChunkPos(chunkLong);
+                if (level.hasChunk(chunkPos.x, chunkPos.z)) {
+                    enqueueLoadedChunk(data, chunkPos);
+                    continue;
+                }
+
+                backgroundChunk.waitTicks++;
+                if (
+                        backgroundChunk.waitTicks
+                                == DetonationTuning.FalloutTerrain
+                                .BACKGROUND_SYNC_LOAD_FALLBACK_TICKS
+                ) {
+                    /* Two chunks maximum: reliable without returning to square batches. */
+                    level.getChunk(chunkPos.x, chunkPos.z);
+                }
+
+                if (
+                        backgroundChunk.waitTicks
+                                >= DetonationTuning.FalloutTerrain
+                                .BACKGROUND_FORCE_LOAD_TIMEOUT_TICKS
+                ) {
+                    LOGGER.warn(
+                            "Fallout terrain chunk {} timed out while force-loading; it remains incomplete and will retry.",
+                            chunkPos
+                    );
+                    if (activeChunk == chunkLong && activeTask != null) {
+                        pausedTasks.put(activeChunk, activeTask);
+                        clearActiveTask();
+                    }
+                    releaseForcedChunk(level, chunkLong);
+                    backgroundCooldown =
+                            DetonationTuning.FalloutTerrain
+                                    .BACKGROUND_CHUNK_INTERVAL_TICKS;
+                }
+            }
+
+            if (backgroundCooldown > 0 || availableBackgroundSlots <= 0) {
+                return;
+            }
+
+            int localCapacity = Math.min(
+                    availableBackgroundSlots,
+                    DetonationTuning.FalloutTerrain
+                            .BACKGROUND_CHUNKS_PER_SCHEDULER
+                            - forcedChunks.size()
+            );
+            if (localCapacity <= 0) {
+                return;
+            }
+
+            advanceBackgroundCursor(data);
+            int scanCursor = backgroundCursor;
+            int scannedTargets = 0;
+
+            while (
+                    localCapacity > 0
+                            && scanCursor < orderedChunks.length
+                            && scannedTargets++
+                            < DetonationTuning.FalloutTerrain
+                            .BACKGROUND_TARGET_SCAN_PER_TICK
+            ) {
+                long chunkLong = orderedChunks[scanCursor];
+                if (data.isTerrainChunkProcessed(zone.effectId(), chunkLong)) {
+                    scanCursor++;
+                    continue;
+                }
+
+                if (
+                        chunkLong == activeChunk
+                                || queuedChunks.contains(chunkLong)
+                                || forcedChunks.containsKey(chunkLong)
+                ) {
+                    scanCursor++;
+                    continue;
+                }
+
+                ChunkPos chunkPos = new ChunkPos(chunkLong);
+                if (level.hasChunk(chunkPos.x, chunkPos.z)) {
+                    enqueueLoadedChunk(data, chunkPos);
+                    scanCursor++;
+                    continue;
+                }
+
+                TERRAIN_TICKET_CONTROLLER.forceChunk(
+                        level,
+                        zone.centre(),
+                        chunkPos.x,
+                        chunkPos.z,
+                        true,
+                        false
+                );
+                forcedChunks.put(
+                        chunkLong,
+                        new BackgroundChunk()
+                );
+                localCapacity--;
+                scanCursor++;
+            }
+        }
+
+        private int forcedChunkCount() {
+            return forcedChunks.size();
+        }
+
+        private void finishForcedChunk(
+                ServerLevel level,
+                DetonationSavedData data,
+                long chunkLong
+        ) {
+            releaseForcedChunk(level, chunkLong);
+            advanceBackgroundCursor(data);
+            backgroundCooldown =
+                    DetonationTuning.FalloutTerrain
+                            .BACKGROUND_CHUNK_INTERVAL_TICKS;
+        }
+
+        private void advanceBackgroundCursor(DetonationSavedData data) {
+            while (
+                    backgroundCursor < orderedChunks.length
+                            && data.isTerrainChunkProcessed(
+                            zone.effectId(),
+                            orderedChunks[backgroundCursor]
+                    )
+            ) {
+                backgroundCursor++;
+            }
+        }
+
+        private void releaseForcedChunk(
+                ServerLevel level,
+                long chunkLong
+        ) {
+            BackgroundChunk removed = forcedChunks.remove(chunkLong);
+            if (removed == null) {
+                return;
+            }
+
+            ChunkPos chunkPos = new ChunkPos(chunkLong);
+            TERRAIN_TICKET_CONTROLLER.forceChunk(
+                    level,
+                    zone.centre(),
+                    chunkPos.x,
+                    chunkPos.z,
+                    false,
+                    false
+            );
+        }
+
+        private void releaseForcedChunks(ServerLevel level) {
+            for (long chunkLong : new ArrayList<>(forcedChunks.keySet())) {
+                releaseForcedChunk(level, chunkLong);
+            }
+        }
+
+        private void clearActiveTask() {
+            activeTask = null;
+            activeChunk = NO_CHUNK;
+            activeForced = false;
+        }
+
+        private boolean isRimSafetyChunk(long chunkLong) {
+            return chunkDistanceSquared(new ChunkPos(chunkLong), zone)
+                    <= rimSafetyRadiusSquared;
+        }
+
+        private boolean isRimSafetyAreaComplete(
+                DetonationSavedData data
+        ) {
+            if (incompleteRimSafetyChunks <= 0) {
+                return true;
+            }
+
+            /* Reconcile only the explicit near-field target set. */
+            int remaining = 0;
+            for (long chunkLong : rimSafetyChunks) {
+                if (!data.isTerrainChunkProcessed(zone.effectId(), chunkLong)) {
+                    remaining++;
+                }
+            }
+            incompleteRimSafetyChunks = remaining;
+            return remaining == 0;
+        }
+
+        private void tickProgressLog() {
+            if (--progressLogCountdown > 0) {
+                return;
+            }
+
+            progressLogCountdown =
+                    DetonationTuning.FalloutTerrain.PROGRESS_LOG_INTERVAL_TICKS;
+            LOGGER.info(
+                    "Fallout terrain at {}: {} / {} chunks complete ({} queued, {} DH background chunks).",
+                    zone.centre(),
+                    completedTargetChunks,
+                    orderedChunks.length,
+                    readyChunks.size(),
+                    forcedChunks.size()
+            );
         }
 
         private double currentRadius() {
-            return Math.max(zone.visualScale(), currentRadius);
+            return Math.min(
+                    zone.falloutRadius(),
+                    Math.max(zone.visualScale(), currentRadius)
+            );
+        }
+
+        private static final class BackgroundChunk {
+            private int waitTicks;
         }
 
         private record StepResult(int blockChecks, boolean complete) {

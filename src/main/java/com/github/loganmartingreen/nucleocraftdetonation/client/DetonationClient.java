@@ -5,6 +5,7 @@ import com.github.loganmartingreen.nucleocraftdetonation.client.render.Detonatio
 import com.github.loganmartingreen.nucleocraftdetonation.compat.distanthorizons.DistantHorizonsCompat;
 import com.github.loganmartingreen.nucleocraftdetonation.config.DetonationTuning;
 import com.github.loganmartingreen.nucleocraftdetonation.network.DetonationNetwork.DetonationEffectsPayload;
+import com.github.loganmartingreen.nucleocraftdetonation.network.DetonationNetwork.DistantHorizonsPresencePayload;
 import com.github.loganmartingreen.nucleocraftdetonation.network.DetonationNetwork.FalloutVisualPayload;
 import com.github.loganmartingreen.nucleocraftdetonation.network.DetonationNetwork.PersistentVisualEntry;
 import com.github.loganmartingreen.nucleocraftdetonation.network.DetonationNetwork.PersistentVisualSyncPayload;
@@ -27,6 +28,7 @@ import net.neoforged.neoforge.client.event.ClientTickEvent;
 import net.neoforged.neoforge.client.event.RenderGuiEvent;
 import net.neoforged.neoforge.client.event.ScreenEvent;
 import net.neoforged.neoforge.client.event.ViewportEvent;
+import net.neoforged.neoforge.network.PacketDistributor;
 
 import org.joml.Vector3f;
 
@@ -67,6 +69,7 @@ public final class DetonationClient {
     private static PersistentVisualSyncPayload pendingPersistentSync;
     private static float currentFalloutIntensity;
     private static int previousWaterTintStage = -1;
+    private static boolean distantHorizonsPresenceSent;
 
     private DetonationClient() {
     }
@@ -275,6 +278,20 @@ public final class DetonationClient {
             previousLevel = minecraft.level;
         }
 
+        if (!distantHorizonsPresenceSent) {
+            if (!DistantHorizonsCompat.isInstalled()) {
+                PacketDistributor.sendToServer(
+                        new DistantHorizonsPresencePayload(false)
+                );
+                distantHorizonsPresenceSent = true;
+            } else if (DistantHorizonsCompat.isOperational()) {
+                PacketDistributor.sendToServer(
+                        new DistantHorizonsPresencePayload(true)
+                );
+                distantHorizonsPresenceSent = true;
+            }
+        }
+
         if (pendingPersistentSync != null) {
             PersistentVisualSyncPayload payload = pendingPersistentSync;
             pendingPersistentSync = null;
@@ -291,9 +308,9 @@ public final class DetonationClient {
         );
 
         tickImmediateDetonations(minecraft);
+        DistantHorizonsCompat.tick(minecraft);
         DetonationParticleSystem.tick(minecraft);
         DetonationShockwaveRenderer.tick();
-        DistantHorizonsCompat.tick(minecraft);
 
         float intensity = falloutIntensity();
 
@@ -427,6 +444,7 @@ public final class DetonationClient {
         clearAll();
         pendingPersistentSync = null;
         previousLevel = null;
+        distantHorizonsPresenceSent = false;
     }
 
     private static void tickFallout(
@@ -549,22 +567,22 @@ public final class DetonationClient {
             double radius
     ) {
         double normalisedDistance = distance / radius;
+        double fullStrengthRatio = Math.clamp(
+                DetonationTuning.Fallout.FULL_STRENGTH_RADIUS_RATIO,
+                0.0D,
+                1.0D
+        );
 
         if (
-                normalisedDistance
-                        <= DetonationTuning.Fallout.FULL_STRENGTH_RADIUS_RATIO
+                fullStrengthRatio >= 1.0D
+                        || normalisedDistance <= fullStrengthRatio
         ) {
             return 1.0F;
         }
 
         double fadeProgress =
-                (
-                        normalisedDistance
-                                - DetonationTuning.Fallout.FULL_STRENGTH_RADIUS_RATIO
-                ) / (
-                        1.0D
-                                - DetonationTuning.Fallout.FULL_STRENGTH_RADIUS_RATIO
-                );
+                (normalisedDistance - fullStrengthRatio)
+                        / (1.0D - fullStrengthRatio);
 
         return (float) (1.0D - smoothstep(fadeProgress));
     }

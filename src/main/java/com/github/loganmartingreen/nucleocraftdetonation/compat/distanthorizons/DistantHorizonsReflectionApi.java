@@ -357,37 +357,45 @@ final class DistantHorizonsReflectionApi {
         }
     }
 
-    boolean overwriteChunkData(Object levelWrapper, Object[] chunks) {
+    boolean overwriteChunkData(
+            Object levelWrapper,
+            Object minecraftLevel,
+            Iterable<?> chunks
+    ) {
         if (!tryInitialize()
                 || terrainRepo == null
                 || levelWrapper == null
-                || chunks.length == 0) {
+                || minecraftLevel == null) {
             return false;
         }
 
+        boolean submittedAny = false;
+
         try {
-            invoke(
-                    terrainRepo,
-                    "overwriteChunkDataAsync",
-                    levelWrapper,
-                    chunks
-            );
-            return true;
+            /*
+             * DH expects one Object[] per chunk containing the vanilla chunk
+             * object followed by its ClientLevel/ServerLevel. Passing several
+             * chunks inside one array can cause DH to reject the data and stop
+             * updating its renderer on non-flat terrain.
+             */
+            for (Object chunk : chunks) {
+                if (chunk == null) {
+                    continue;
+                }
+
+                invoke(
+                        terrainRepo,
+                        "overwriteChunkDataAsync",
+                        levelWrapper,
+                        new Object[]{chunk, minecraftLevel}
+                );
+                submittedAny = true;
+            }
+
+            return submittedAny;
         } catch (ReflectiveOperationException | RuntimeException exception) {
-            warnOnce("Unable to submit crater chunks to Distant Horizons.", exception);
+            warnOnce("Unable to submit changed chunks to Distant Horizons.", exception);
             return false;
-        }
-    }
-
-    void clearRenderCache() {
-        if (!tryInitialize() || renderProxy == null) {
-            return;
-        }
-
-        try {
-            invokeOptional(renderProxy, "clearRenderDataCache");
-        } catch (ReflectiveOperationException | RuntimeException ignored) {
-            /* Optional fallback only. */
         }
     }
 

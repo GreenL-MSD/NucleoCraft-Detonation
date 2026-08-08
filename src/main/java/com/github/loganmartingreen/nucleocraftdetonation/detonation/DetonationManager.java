@@ -256,30 +256,13 @@ public final class DetonationManager {
             CraterTask task =
                     activeCrater.task;
 
-            if (
-                    task.tick(
-                            level,
-                            DetonationTuning.Command.CRATER_OPERATIONS_PER_TICK
-                    )
-            ) {
-                sendToOwner(
-                        server,
-                        task.owner(),
-                        Component.literal(
-                                task.yield().displayName()
-                                        + " crater complete."
-                        )
-                );
-
-                PacketDistributor.sendToPlayersInDimension(
+            if (!activeCrater.falloutStarted) {
+                if (!task.tickExcavation(
                         level,
-                        new CraterLodRefreshPayload(
-                                task.centre(),
-                                task.dimensions().radius()
-                                        + task.dimensions().rimWidth()
-                                        + 16
-                        )
-                );
+                        DetonationTuning.Command.CRATER_OPERATIONS_PER_TICK
+                )) {
+                    continue;
+                }
 
                 DetonationSavedData savedData =
                         DetonationSavedData.get(server);
@@ -290,9 +273,49 @@ public final class DetonationManager {
                         level,
                         activeCrater.terrainEffectId
                 );
-
-                iterator.remove();
+                activeCrater.falloutStarted = true;
+                continue;
             }
+
+            /*
+             * Do not write the raised crater edge until every fallout chunk
+             * close enough to touch the crater/rim has completed. Distant
+             * fallout can continue persistently after the rim without being
+             * allowed to cut back through the finished crater edge.
+             */
+            if (FalloutTerrainManager.isRimSafetyAreaIncomplete(
+                    activeCrater.terrainEffectId
+            )) {
+                continue;
+            }
+
+            if (!task.tickRim(
+                    level,
+                    DetonationTuning.Command.CRATER_OPERATIONS_PER_TICK
+            )) {
+                continue;
+            }
+
+            sendToOwner(
+                    server,
+                    task.owner(),
+                    Component.literal(
+                            task.yield().displayName()
+                                    + " crater and final rim complete."
+                    )
+            );
+
+            PacketDistributor.sendToPlayersInDimension(
+                    level,
+                    new CraterLodRefreshPayload(
+                            task.centre(),
+                            task.dimensions().radius()
+                                    + task.dimensions().rimWidth()
+                                    + 16
+                    )
+            );
+
+            iterator.remove();
         }
     }
 
@@ -405,10 +428,20 @@ public final class DetonationManager {
         }
     }
 
-    private record ActiveCrater(
-            ResourceKey<Level> dimension,
-            CraterTask task,
-            long terrainEffectId
-    ) {
+    private static final class ActiveCrater {
+        private final ResourceKey<Level> dimension;
+        private final CraterTask task;
+        private final long terrainEffectId;
+        private boolean falloutStarted;
+
+        private ActiveCrater(
+                ResourceKey<Level> dimension,
+                CraterTask task,
+                long terrainEffectId
+        ) {
+            this.dimension = dimension;
+            this.task = task;
+            this.terrainEffectId = terrainEffectId;
+        }
     }
 }

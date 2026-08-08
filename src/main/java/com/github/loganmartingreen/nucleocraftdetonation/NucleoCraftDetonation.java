@@ -19,6 +19,7 @@ public final class NucleoCraftDetonation {
         DetonationBlocks.register(modBus);
         DetonationSounds.SOUND_EVENTS.register(modBus);
         DetonationParticles.register(modBus);
+        modBus.addListener(FalloutTerrainManager::registerTicketController);
 
         NeoForge.EVENT_BUS.addListener(DetonationCommands::onRegisterCommands);
         NeoForge.EVENT_BUS.addListener(DetonationManager::onServerTick);

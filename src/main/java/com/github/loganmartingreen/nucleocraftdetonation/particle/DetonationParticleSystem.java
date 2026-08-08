@@ -1,6 +1,7 @@
 package com.github.loganmartingreen.nucleocraftdetonation.particle;
 
 import com.github.loganmartingreen.nucleocraftdetonation.NucleoCraftDetonation;
+import com.github.loganmartingreen.nucleocraftdetonation.compat.distanthorizons.DistantHorizonsCompat;
 import com.github.loganmartingreen.nucleocraftdetonation.config.DetonationTuning;
 import com.github.loganmartingreen.nucleocraftdetonation.particle.DetonationParticles.TintedPoofOptions;
 
@@ -12,6 +13,9 @@ import net.minecraft.client.particle.ParticleRenderType;
 import net.minecraft.client.particle.SpriteSet;
 import net.minecraft.client.particle.TextureSheetParticle;
 import net.minecraft.util.Mth;
+import net.minecraft.world.level.ClipContext;
+import net.minecraft.world.phys.HitResult;
+import net.minecraft.world.phys.Vec3;
 
 import net.neoforged.api.distmarker.Dist;
 import net.neoforged.bus.api.SubscribeEvent;
@@ -135,7 +139,19 @@ public final class DetonationParticleSystem {
                     cloud.centreZ
             );
 
-            if (distanceSquared <= viewDistance * viewDistance) {
+            boolean distantLodActive = DistantHorizonsCompat.isDistantCloudActive(
+                    cloud.centreX,
+                    cloud.centreY,
+                    cloud.centreZ,
+                    cloud.visualScale
+            );
+            cloud.detailedParticlesVisible = !distantLodActive
+                    && hasCloudLineOfSight(minecraft, cloud);
+
+            if (
+                    cloud.detailedParticlesVisible
+                            && distanceSquared <= viewDistance * viewDistance
+            ) {
                 spawnCloudTick(level, cloud);
             }
 
@@ -148,6 +164,100 @@ public final class DetonationParticleSystem {
                 iterator.remove();
             }
         }
+    }
+
+    private static boolean hasCloudLineOfSight(
+            Minecraft minecraft,
+            ActiveCloud cloud
+    ) {
+        if (minecraft.player == null || minecraft.level == null) {
+            return false;
+        }
+
+        double capCentreY = getFireballCentreY(
+                cloud.centreY,
+                cloud.visualScale,
+                cloud.ageTicks
+        );
+        double capRadius = getCurrentHorizontalRadius(
+                cloud.visualScale,
+                cloud.ageTicks
+        );
+        double capVerticalRadius = getCurrentVerticalRadius(
+                cloud.visualScale,
+                cloud.ageTicks
+        );
+        Vec3 eye = minecraft.player.getEyePosition();
+        Vec3 centre = new Vec3(cloud.centreX, capCentreY, cloud.centreZ);
+
+        if (eye.distanceToSqr(centre)
+                <= DetonationTuning.ParticleCloud.PARTICLE_OCCLUSION_START_DISTANCE
+                * DetonationTuning.ParticleCloud.PARTICLE_OCCLUSION_START_DISTANCE) {
+            return true;
+        }
+
+        double sideOffset = capRadius
+                * DetonationTuning.ParticleCloud.PARTICLE_OCCLUSION_SAMPLE_RADIUS_RATIO;
+        Vec3[] samples = new Vec3[]{
+                centre,
+                centre.add(0.0D, capVerticalRadius * 0.82D, 0.0D),
+                centre.add(sideOffset, 0.0D, 0.0D),
+                centre.add(-sideOffset, 0.0D, 0.0D),
+                centre.add(0.0D, 0.0D, sideOffset),
+                centre.add(0.0D, 0.0D, -sideOffset)
+        };
+
+        for (Vec3 target : samples) {
+            HitResult result = minecraft.level.clip(
+                    new ClipContext(
+                            eye,
+                            target,
+                            ClipContext.Block.COLLIDER,
+                            ClipContext.Fluid.NONE,
+                            minecraft.player
+                    )
+            );
+            if (
+                    result.getType() == HitResult.Type.MISS
+                            || result.getLocation().distanceToSqr(eye)
+                            >= target.distanceToSqr(eye) - 1.0D
+            ) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static boolean shouldCullForDistantLod(
+            double particleX,
+            double particleY,
+            double particleZ
+    ) {
+        for (ActiveCloud cloud : ACTIVE_CLOUDS) {
+            if (cloud.detailedParticlesVisible) {
+                continue;
+            }
+
+            double horizontalRadius = getLateExpandedCloudRadius(cloud.visualScale)
+                    * DetonationTuning.DistantHorizons.PARTICLE_CULL_CLOUD_RADIUS_MULTIPLIER;
+            double dx = particleX - cloud.centreX;
+            double dz = particleZ - cloud.centreZ;
+            if (dx * dx + dz * dz > horizontalRadius * horizontalRadius) {
+                continue;
+            }
+
+            double minimumY = cloud.centreY
+                    - getStemGroundExtension(cloud.visualScale)
+                    - 8.0D;
+            double maximumY = cloud.centreY
+                    + getStemHeight(cloud.visualScale)
+                    + getCurrentVerticalRadius(cloud.visualScale, cloud.ageTicks) * 2.0D;
+            if (particleY >= minimumY && particleY <= maximumY) {
+                return true;
+            }
+        }
+        return false;
     }
 
     public static void clear() {
@@ -173,12 +283,17 @@ public final class DetonationParticleSystem {
                     cloud.visualScale,
                     cloud.ageTicks
             );
-            double stemHeight = Math.max(
+            double stemAboveGroundHeight = Math.max(
                     0.0D,
                     capCentreY
                             - cloud.centreY
                             - capVerticalRadius * 0.36D
             );
+            double stemGroundExtension = getStemGroundExtension(
+                    cloud.visualScale
+            );
+            double stemBaseY = cloud.centreY - stemGroundExtension;
+            double stemHeight = stemAboveGroundHeight + stemGroundExtension;
 
             snapshots.add(
                     new CloudSnapshot(
@@ -194,6 +309,7 @@ public final class DetonationParticleSystem {
                                     cloud.ageTicks
                             ),
                             capVerticalRadius,
+                            stemBaseY,
                             stemHeight,
                             getAscentProgress(
                                     cloud.visualScale,
@@ -478,12 +594,15 @@ public final class DetonationParticleSystem {
          * The stem follows directly behind the slowly rising fireball. It can
          * never outrun the head or create a disconnected pre-built cap.
          */
-        double stemHeight = Math.max(
+        double stemAboveGroundHeight = Math.max(
                 0.0D,
                 headCentreY
                         - cloud.centreY
                         - headVerticalRadius * 0.36D
         );
+        double stemGroundExtension = getStemGroundExtension(cloud.visualScale);
+        double stemBaseY = cloud.centreY - stemGroundExtension;
+        double stemHeight = stemAboveGroundHeight + stemGroundExtension;
 
         if (stemHeight <= 0.5D) {
             return;
@@ -567,7 +686,7 @@ public final class DetonationParticleSystem {
             double distance = localRadius * Math.sqrt(level.random.nextDouble());
 
             double x = cloud.centreX + Math.cos(angle) * distance;
-            double y = cloud.centreY + stemHeight * heightProgress;
+            double y = stemBaseY + stemHeight * heightProgress;
             double z = cloud.centreZ + Math.sin(angle) * distance;
 
             float size = (float) Math.clamp(
@@ -967,6 +1086,20 @@ public final class DetonationParticleSystem {
         );
     }
 
+    public static double getStemGroundExtension(
+            float visualScale
+    ) {
+        return Math.clamp(
+                visualScale
+                        * DetonationTuning.ParticleCloud
+                        .STEM_GROUND_EXTENSION_RADIUS_RATIO,
+                DetonationTuning.ParticleCloud
+                        .STEM_GROUND_EXTENSION_MINIMUM,
+                DetonationTuning.ParticleCloud
+                        .STEM_GROUND_EXTENSION_MAXIMUM
+        );
+    }
+
     public static double getMatureCloudRadius(
             float visualScale
     ) {
@@ -1176,6 +1309,7 @@ public final class DetonationParticleSystem {
             double capCentreY,
             double capRadius,
             double capVerticalRadius,
+            double stemBaseY,
             double stemHeight,
             boolean atMaximumHeight
     ) {
@@ -1196,6 +1330,7 @@ public final class DetonationParticleSystem {
         private final float strength;
 
         private int ageTicks;
+        private boolean detailedParticlesVisible = true;
 
         private ActiveCloud(
                 double centreX,
@@ -1301,6 +1436,11 @@ public final class DetonationParticleSystem {
 
         @Override
         public void tick() {
+            if (shouldCullForDistantLod(this.x, this.y, this.z)) {
+                this.remove();
+                return;
+            }
+
             super.tick();
 
             if (this.removed) {

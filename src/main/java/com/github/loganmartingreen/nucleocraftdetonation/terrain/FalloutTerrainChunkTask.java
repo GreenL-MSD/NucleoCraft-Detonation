@@ -137,8 +137,9 @@ final class FalloutTerrainChunkTask {
         int worldX = worldX();
         int worldZ = worldZ();
 
-        columnProfile = profileColumn(worldX, worldZ);
-        if (columnProfile.severity <= 0.0D) {
+        double dx = worldX + 0.5D - zone.centre().getX();
+        double dz = worldZ + 0.5D - zone.centre().getZ();
+        if (dx * dx + dz * dz > zone.falloutRadius() * zone.falloutRadius()) {
             columnReady = false;
             return;
         }
@@ -160,6 +161,12 @@ final class FalloutTerrainChunkTask {
             return;
         }
 
+        columnProfile = profileColumn(worldX, worldZ, groundY);
+        if (columnProfile.severity <= 0.0D) {
+            columnReady = false;
+            return;
+        }
+
         int scanDepth = columnProfile.inStoneCore
                 ? scaledStoneCoreDepth()
                 : DetonationTuning.FalloutTerrain.VEGETATION_SCAN_DEPTH;
@@ -168,7 +175,7 @@ final class FalloutTerrainChunkTask {
         if (columnProfile.inBlastClearZone) {
             requiredBottom = Math.min(
                     requiredBottom,
-                    blastClearFloorY() - 2
+                    columnProfile.blastClearFloorY - 2
             );
         }
 
@@ -231,16 +238,26 @@ final class FalloutTerrainChunkTask {
         }
 
         /*
-         * The primary blast clears a circular volume above the crater rim.
-         * This removes mountains, buildings and trees that would otherwise
-         * unrealistically remain standing behind the crater.
+         * The blast-bowl has a flat centre and a rapidly rising ellipsoidal
+         * edge. Natural terrain above that curved floor is excavated, making a
+         * rounded bite in mountains rather than a clean vertical slice. Any
+         * building above the local ground surface is removed completely.
          */
-        if (
-                profile.inBlastClearZone
-                        && y > blastClearFloorY()
-                        && !isBlastProtected(state)
-        ) {
-            return Blocks.AIR.defaultBlockState();
+        if (profile.inBlastClearZone && !isBlastProtected(state)) {
+            if (y > groundY) {
+                return Blocks.AIR.defaultBlockState();
+            }
+
+            if (y > profile.blastClearFloorY) {
+                return Blocks.AIR.defaultBlockState();
+            }
+
+            if (
+                    y >= profile.blastClearFloorY - 1
+                            && isTerrainFoundation(state)
+            ) {
+                return chooseCharredStone(x, y, z);
+            }
         }
 
         /*
@@ -258,6 +275,22 @@ final class FalloutTerrainChunkTask {
             if (y == pitFloorY && isTerrainFoundation(state)) {
                 return chooseCharredStone(x, y, z);
             }
+        }
+
+        /*
+         * The full inner charred zone is absolute rather than chance based.
+         * This catches ores, gravel, clay and other solid terrain that are not
+         * members of the vanilla base-stone tag, so the inside of very large
+         * craters cannot retain random untouched patches.
+         */
+        if (
+                profile.inStoneCore
+                        && y <= groundY
+                        && currentTerrainDepth < scaledStoneCoreDepth()
+                        && state.getFluidState().isEmpty()
+                        && !isBlastProtected(state)
+        ) {
+            return chooseCharredStone(x, y, z);
         }
 
         if (isFalloutBlock(state)) {
@@ -502,7 +535,7 @@ final class FalloutTerrainChunkTask {
                 : DetonationBlocks.CHARRED_STONE_1.get().defaultBlockState();
     }
 
-    private ColumnProfile profileColumn(int x, int z) {
+    private ColumnProfile profileColumn(int x, int z, int localGroundY) {
         double dx = x + 0.5D - zone.centre().getX();
         double dz = z + 0.5D - zone.centre().getZ();
         double distance = Math.sqrt(dx * dx + dz * dz);
@@ -547,13 +580,89 @@ final class FalloutTerrainChunkTask {
         double treeCutRadius = zone.visualScale()
                 + DetonationTuning.FalloutTerrain.TREE_CUT_EDGE_DISTANCE_AT_REFERENCE
                 * yieldScale;
-        double blastClearRadius = zone.visualScale()
-                + DetonationTuning.FalloutTerrain.BLAST_CLEAR_EDGE_DISTANCE_AT_REFERENCE
-                * yieldScale;
+
+        double blastClearRadius = Math.min(
+                zone.visualScale()
+                        * DetonationTuning.FalloutTerrain.BLAST_BOWL_CRATER_RADIUS_MULTIPLIER,
+                zone.falloutRadius()
+                        * DetonationTuning.FalloutTerrain.BLAST_BOWL_MAX_FALLOUT_RADIUS_RATIO
+        );
+        blastClearRadius = Math.max(
+                zone.visualScale()
+                        + DetonationTuning.FalloutTerrain.BLAST_BOWL_INNER_PROTECTION_PADDING
+                        + 1.0D,
+                blastClearRadius
+        );
 
         double noisyBlastClearRadius = blastClearRadius
                 * (1.0D + broadNoise
-                * DetonationTuning.FalloutTerrain.BLAST_CLEAR_RADIUS_NOISE_STRENGTH);
+                * DetonationTuning.FalloutTerrain.BLAST_BOWL_RADIUS_NOISE_STRENGTH);
+        double protectedInnerRadius = zone.visualScale()
+                + DetonationTuning.FalloutTerrain.BLAST_BOWL_INNER_PROTECTION_PADDING;
+
+        boolean inBlastClearZone = distance > protectedInnerRadius
+                && distance <= noisyBlastClearRadius;
+        int blastClearFloorY = Integer.MAX_VALUE;
+
+        if (inBlastClearZone) {
+            double progress = Math.clamp(
+                    (distance - protectedInnerRadius)
+                            / Math.max(
+                            1.0D,
+                            noisyBlastClearRadius - protectedInnerRadius
+                    ),
+                    0.0D,
+                    1.0D
+            );
+            double curvedProgress = Math.pow(
+                    progress,
+                    DetonationTuning.FalloutTerrain.BLAST_BOWL_CURVE_POWER
+            );
+            double maximumRise = Math.min(
+                    DetonationTuning.FalloutTerrain.BLAST_BOWL_MAX_RISE_BLOCKS,
+                    blastClearRadius
+                            * DetonationTuning.FalloutTerrain.BLAST_BOWL_MAX_RISE_RATIO
+            );
+            double verticalNoise = (broadNoise * 0.72D + detailNoise * 0.28D)
+                    * blastClearRadius
+                    * DetonationTuning.FalloutTerrain.BLAST_BOWL_VERTICAL_NOISE_RATIO;
+
+            int absoluteBowlFloorY = (int) Math.round(
+                    zone.centre().getY()
+                            + DetonationTuning.FalloutTerrain.BLAST_CLEAR_ABOVE_RIM_OFFSET
+                            + maximumRise * curvedProgress
+                            + verticalNoise
+            );
+
+            int maximumLocalCutDepth = Math.clamp(
+                    (int) Math.round(
+                            zone.visualScale()
+                                    * DetonationTuning.FalloutTerrain
+                                    .BLAST_BOWL_LOCAL_CUT_DEPTH_RATIO
+                    ),
+                    DetonationTuning.FalloutTerrain
+                            .BLAST_BOWL_LOCAL_CUT_DEPTH_MIN,
+                    DetonationTuning.FalloutTerrain
+                            .BLAST_BOWL_LOCAL_CUT_DEPTH_MAX
+            );
+            double localCutStrength = Math.pow(
+                    1.0D - smoothstep(progress),
+                    DetonationTuning.FalloutTerrain
+                            .BLAST_BOWL_LOCAL_CUT_TAPER_POWER
+            );
+            int localSurfaceFloorY = localGroundY
+                    - (int) Math.round(maximumLocalCutDepth * localCutStrength);
+
+            /*
+             * The absolute envelope still creates the broad curved bowl, while
+             * the local floor prevents a mountain from being cut hundreds of
+             * blocks down into a one-sided shell wall.
+             */
+            blastClearFloorY = Math.max(
+                    absoluteBowlFloorY,
+                    localSurfaceFloorY
+            );
+        }
 
         int secondaryBlastDepth = secondaryBlastDepthAt(x, z, distance);
 
@@ -579,7 +688,8 @@ final class FalloutTerrainChunkTask {
                 distance <= coreRadius,
                 inTreeCutZone,
                 allowedStumpHeight,
-                distance <= noisyBlastClearRadius,
+                inBlastClearZone,
+                blastClearFloorY,
                 secondaryBlastDepth
         );
     }
@@ -779,11 +889,6 @@ final class FalloutTerrainChunkTask {
                 DetonationTuning.FalloutTerrain.MINIMUM_STONE_CORE_DEPTH,
                 DetonationTuning.FalloutTerrain.MAXIMUM_STONE_CORE_DEPTH
         );
-    }
-
-    private int blastClearFloorY() {
-        return zone.centre().getY()
-                + DetonationTuning.FalloutTerrain.BLAST_CLEAR_ABOVE_RIM_OFFSET;
     }
 
     private static BlockState copyLogAxis(BlockState source, BlockState target) {
@@ -1083,6 +1188,7 @@ final class FalloutTerrainChunkTask {
             boolean inTreeCutZone,
             int allowedStumpHeight,
             boolean inBlastClearZone,
+            int blastClearFloorY,
             int secondaryBlastDepth
     ) {
         private static final ColumnProfile OUTSIDE = new ColumnProfile(
@@ -1093,6 +1199,7 @@ final class FalloutTerrainChunkTask {
                 false,
                 0,
                 false,
+                Integer.MAX_VALUE,
                 0
         );
     }

@@ -2,6 +2,7 @@ package com.github.loganmartingreen.nucleocraftdetonation.compat.distanthorizons
 
 import com.github.loganmartingreen.nucleocraftdetonation.client.DetonationClient;
 import com.github.loganmartingreen.nucleocraftdetonation.config.DetonationTuning;
+import com.github.loganmartingreen.nucleocraftdetonation.network.DetonationNetwork.TerrainChunkLodRefreshCompletePayload;
 import com.github.loganmartingreen.nucleocraftdetonation.particle.DetonationParticleSystem;
 import com.github.loganmartingreen.nucleocraftdetonation.particle.DetonationParticleSystem.CloudSnapshot;
 import com.mojang.logging.LogUtils;
@@ -13,6 +14,7 @@ import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.chunk.LevelChunk;
 
 import net.neoforged.fml.ModList;
+import net.neoforged.neoforge.network.PacketDistributor;
 
 import org.slf4j.Logger;
 
@@ -48,18 +50,47 @@ public final class DistantHorizonsCompat {
             new HashMap<>();
     private static final ArrayDeque<PendingChunkRefresh> PENDING_CHUNKS =
             new ArrayDeque<>();
-    private static final Set<Long> QUEUED_CHUNKS = new HashSet<>();
+    private static final Set<PendingRefreshKey> QUEUED_CHUNKS =
+            new HashSet<>();
 
     private static ClientLevel previousLevel;
     private static float lastFogIntensity = -1.0F;
     private static int ticks;
-    private static boolean craterCacheRefreshNeeded;
 
     private DistantHorizonsCompat() {
     }
 
     public static boolean isInstalled() {
         return INSTALLED;
+    }
+
+    /** True only after the installed DH API v3 bridge is usable. */
+    public static boolean isOperational() {
+        return INSTALLED && API.tryInitialize();
+    }
+
+    /** True only while DH has a registered, active LOD model for this cloud. */
+    public static boolean isDistantCloudActive(
+            double centreX,
+            double centreY,
+            double centreZ,
+            float visualScale
+    ) {
+        if (!INSTALLED) {
+            return false;
+        }
+
+        DistantCloud cloud = DISTANT_CLOUDS.get(
+                new CloudKey(
+                        Double.doubleToLongBits(centreX),
+                        Double.doubleToLongBits(centreY),
+                        Double.doubleToLongBits(centreZ),
+                        Float.floatToIntBits(visualScale)
+                )
+        );
+        return cloud != null
+                && cloud.active
+                && cloud.registeredGroup != null;
     }
 
     public static void tick(Minecraft minecraft) {
@@ -94,6 +125,11 @@ public final class DistantHorizonsCompat {
             return;
         }
 
+        ClientLevel level = Minecraft.getInstance().level;
+        if (level == null) {
+            return;
+        }
+
         int chunkRadius = Math.max(
                 1,
                 (int) Math.ceil(Math.max(1, affectedRadius) / 16.0D) + 1
@@ -107,16 +143,45 @@ public final class DistantHorizonsCompat {
             for (int chunkZ = centreChunkZ - chunkRadius;
                  chunkZ <= centreChunkZ + chunkRadius;
                  chunkZ++) {
-                long packed = ChunkPos.asLong(chunkX, chunkZ);
-                if (QUEUED_CHUNKS.add(packed)) {
-                    PENDING_CHUNKS.addLast(
-                            new PendingChunkRefresh(chunkX, chunkZ, 0)
-                    );
+                if (level.hasChunk(chunkX, chunkZ)) {
+                    queueChunkRefresh(0L, chunkX, chunkZ);
                 }
             }
         }
+    }
 
-        craterCacheRefreshNeeded = true;
+    /** Queues one exact loaded chunk for a targeted DH LOD rebuild. */
+    public static void queueChunkRefresh(
+            long terrainEffectId,
+            int chunkX,
+            int chunkZ
+    ) {
+        if (!INSTALLED) {
+            return;
+        }
+
+        ClientLevel level = Minecraft.getInstance().level;
+        if (level == null) {
+            return;
+        }
+
+        PendingRefreshKey key = new PendingRefreshKey(
+                terrainEffectId,
+                ChunkPos.asLong(chunkX, chunkZ)
+        );
+        if (QUEUED_CHUNKS.add(key)) {
+            /*
+             * The server packet commonly arrives a few ticks before the client
+             * LevelChunk. Keep it queued instead of dropping the DH refresh.
+             */
+            PENDING_CHUNKS.addLast(
+                    new PendingChunkRefresh(
+                            terrainEffectId,
+                            chunkX,
+                            chunkZ
+                    )
+            );
+        }
     }
 
     public static void clear() {
@@ -148,11 +213,6 @@ public final class DistantHorizonsCompat {
 
     private static void processCraterRefreshes(Minecraft minecraft) {
         if (PENDING_CHUNKS.isEmpty()) {
-            if (craterCacheRefreshNeeded) {
-                API.clearRenderCache();
-                minecraft.levelRenderer.allChanged();
-                craterCacheRefreshNeeded = false;
-            }
             return;
         }
 
@@ -162,51 +222,75 @@ public final class DistantHorizonsCompat {
         }
 
         List<Object> chunks = new ArrayList<>();
-        int processed = 0;
+        List<PendingChunkRefresh> submitted = new ArrayList<>();
         int scanLimit = Math.min(
                 PENDING_CHUNKS.size(),
                 DetonationTuning.DistantHorizons.CRATER_REFRESH_SCAN_PER_TICK
         );
 
-        while (processed < scanLimit
-                && chunks.size()
-                < DetonationTuning.DistantHorizons.CRATER_REFRESH_CHUNKS_PER_TICK) {
+        for (int scanned = 0;
+             scanned < scanLimit
+                     && chunks.size()
+                     < DetonationTuning.DistantHorizons.CRATER_REFRESH_CHUNKS_PER_TICK;
+             scanned++) {
             PendingChunkRefresh pending = PENDING_CHUNKS.removeFirst();
-            processed++;
+            PendingRefreshKey key = pending.key();
 
-            if (minecraft.level.hasChunk(pending.chunkX, pending.chunkZ)) {
-                LevelChunk chunk = minecraft.level.getChunk(
-                        pending.chunkX,
-                        pending.chunkZ
-                );
-                chunks.add(chunk);
-                QUEUED_CHUNKS.remove(
-                        ChunkPos.asLong(pending.chunkX, pending.chunkZ)
-                );
+            if (!minecraft.level.hasChunk(pending.chunkX, pending.chunkZ)) {
+                retryOrDiscard(pending, key);
                 continue;
             }
 
-            if (pending.attempts
-                    < DetonationTuning.DistantHorizons.CRATER_REFRESH_MAX_ATTEMPTS) {
-                PENDING_CHUNKS.addLast(
-                        new PendingChunkRefresh(
-                                pending.chunkX,
-                                pending.chunkZ,
-                                pending.attempts + 1
-                        )
-                );
-            } else {
-                QUEUED_CHUNKS.remove(
-                        ChunkPos.asLong(pending.chunkX, pending.chunkZ)
-                );
-            }
+            chunks.add(
+                    minecraft.level.getChunk(
+                            pending.chunkX,
+                            pending.chunkZ
+                    )
+            );
+            submitted.add(pending);
         }
 
-        if (!chunks.isEmpty()) {
-            API.overwriteChunkData(
-                    levelWrapper,
-                    chunks.toArray()
-            );
+        if (chunks.isEmpty()) {
+            return;
+        }
+
+        if (API.overwriteChunkData(
+                levelWrapper,
+                minecraft.level,
+                chunks
+        )) {
+            for (PendingChunkRefresh pending : submitted) {
+                QUEUED_CHUNKS.remove(pending.key());
+                if (pending.terrainEffectId != 0L) {
+                    PacketDistributor.sendToServer(
+                            new TerrainChunkLodRefreshCompletePayload(
+                                    pending.terrainEffectId,
+                                    pending.chunkX,
+                                    pending.chunkZ
+                            )
+                    );
+                }
+            }
+        } else {
+            for (PendingChunkRefresh pending : submitted) {
+                retryOrDiscard(pending, pending.key());
+            }
+        }
+    }
+
+    private static void retryOrDiscard(
+            PendingChunkRefresh pending,
+            PendingRefreshKey key
+    ) {
+        pending.attempts++;
+        if (
+                pending.attempts
+                        < DetonationTuning.DistantHorizons
+                        .CRATER_REFRESH_MAX_ATTEMPTS
+        ) {
+            PENDING_CHUNKS.addLast(pending);
+        } else {
+            QUEUED_CHUNKS.remove(key);
         }
     }
 
@@ -252,9 +336,12 @@ public final class DistantHorizonsCompat {
                             * DetonationTuning.DistantHorizons.CLOUD_LOD_DISTANCE_RADIUS_RATIO
             );
 
+            boolean active = distantCloud.registeredGroup != null
+                    && distanceSquared >= nearDistance * nearDistance;
+            distantCloud.active = active;
             API.setGroupActive(
                     distantCloud.registeredGroup,
-                    distanceSquared >= nearDistance * nearDistance
+                    active
             );
         }
 
@@ -346,7 +433,7 @@ public final class DistantHorizonsCompat {
                     * verticalTaper
                     * bulge
                     * middleCurve;
-            double y = cloud.centreY()
+            double y = cloud.stemBaseY()
                     + cloud.stemHeight() * heightProgress;
             double boxSize = Math.max(
                     3.0D,
@@ -645,7 +732,6 @@ public final class DistantHorizonsCompat {
         DISTANT_CLOUDS.clear();
         PENDING_CHUNKS.clear();
         QUEUED_CHUNKS.clear();
-        craterCacheRefreshNeeded = false;
     }
 
     private record CloudKey(
@@ -667,12 +753,36 @@ public final class DistantHorizonsCompat {
     private static final class DistantCloud {
         private Object registeredGroup;
         private int ageBucket = Integer.MIN_VALUE;
+        private boolean active;
     }
 
-    private record PendingChunkRefresh(
-            int chunkX,
-            int chunkZ,
-            int attempts
+    private record PendingRefreshKey(
+            long terrainEffectId,
+            long chunkLong
     ) {
+    }
+
+    private static final class PendingChunkRefresh {
+        private final long terrainEffectId;
+        private final int chunkX;
+        private final int chunkZ;
+        private int attempts;
+
+        private PendingChunkRefresh(
+                long terrainEffectId,
+                int chunkX,
+                int chunkZ
+        ) {
+            this.terrainEffectId = terrainEffectId;
+            this.chunkX = chunkX;
+            this.chunkZ = chunkZ;
+        }
+
+        private PendingRefreshKey key() {
+            return new PendingRefreshKey(
+                    terrainEffectId,
+                    ChunkPos.asLong(chunkX, chunkZ)
+            );
+        }
     }
 }

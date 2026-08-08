@@ -67,7 +67,8 @@ public final class DetonationTuning {
 
         public static final int FADE_IN_TICKS = 20 * 4;
         public static final int FADE_OUT_TICKS = 20 * 20;
-        public static final double FULL_STRENGTH_RADIUS_RATIO = 0.05D;
+        /* The entire saved fallout zone now uses the centre-strength atmosphere. */
+        public static final double FULL_STRENGTH_RADIUS_RATIO = 1.00D;
         public static final float INTENSITY_SMOOTHING = 0.14F;
 
         public static final float FOG_COLOUR_STRENGTH = 0.85F;
@@ -89,15 +90,43 @@ public final class DetonationTuning {
     /** Permanent block conversion, blast damage and outward fallout spread. */
     public static final class FalloutTerrain {
         /*
-         * The v24 terrain rules are applied as a high-budget radial block wave.
-         * This is deliberately not tied to a fixed metres-per-second timer.
+         * The v24 terrain rules are applied by the persistent nearest-first
+         * chunk scheduler. This is not tied to a fixed metres-per-second timer.
          */
         public static final int SPREAD_MAX_AGE_TICKS = 1;
-        public static final int BLOCK_CHECKS_PER_TICK = 250_000;
-        public static final int CATCH_UP_BLOCK_CHECKS_PER_TICK = 80_000;
+        public static final int BLOCK_CHECKS_PER_TICK = 500_000;
+
+        /*
+         * Existing loaded chunks are discovered incrementally. New ChunkEvent
+         * loads are also queued immediately, so render distance only affects
+         * when a chunk becomes eligible, never whether it is forgotten.
+         */
+        public static final int LOADED_DISCOVERY_CHUNKS_PER_TICK = 8_192;
+
+        /*
+         * DH background generation may stage two temporary chunks at once.
+         * Block changes still run on the server thread, but two nearest-first
+         * chunks can be loaded and ready together without returning to a large
+         * square batch loader.
+         */
+        public static final int BACKGROUND_TARGET_SCAN_PER_TICK = 8_192;
+        public static final int BACKGROUND_GLOBAL_FORCE_LOAD_LIMIT = 2;
+        public static final int BACKGROUND_CHUNKS_PER_SCHEDULER = 2;
+        public static final int BACKGROUND_CHUNK_INTERVAL_TICKS = 1;
+        public static final int BACKGROUND_SYNC_LOAD_FALLBACK_TICKS = 3;
+        public static final int BACKGROUND_FORCE_LOAD_TIMEOUT_TICKS = 200;
+
+        /*
+         * The final crater rim waits only for terrain close enough to touch it.
+         * Distant incomplete fallout may continue later as players explore.
+         */
+        public static final double RIM_SAFETY_RADIUS_MULTIPLIER = 1.75D;
+        public static final double RIM_SAFETY_PADDING_BLOCKS = 48.0D;
+
+        public static final int PROGRESS_LOG_INTERVAL_TICKS = 20 * 60;
 
         public static final int VEGETATION_SCAN_DEPTH = 160;
-        public static final int GROUND_SEARCH_DEPTH = 160;
+        public static final int GROUND_SEARCH_DEPTH = 512;
         public static final int SURFACE_STONE_DEPTH = 6;
         public static final int CHARRED_DIRT_DEPTH = 8;
         public static final int CHARRED_SAND_DEPTH = 12;
@@ -145,12 +174,31 @@ public final class DetonationTuning {
         public static final double TREE_STUMP_HEIGHT_POWER = 1.30D;
 
         /*
-         * Clears everything above the crater rim inside a yield-scaled circular
-         * blast volume. This can cut a large circular bite out of a mountain.
+         * A powerful blast-bowl extends out to eight crater radii, capped at
+         * three quarters of the fallout radius. Its floor is nearly flat near the crater
+         * and curves sharply upward near the edge, cutting a rounded bite from
+         * mountains while fully stripping buildings above the local surface.
          */
-        public static final double BLAST_CLEAR_EDGE_DISTANCE_AT_REFERENCE = 20.0D;
-        public static final double BLAST_CLEAR_RADIUS_NOISE_STRENGTH = 0.045D;
-        public static final int BLAST_CLEAR_ABOVE_RIM_OFFSET = 3;
+        public static final double BLAST_BOWL_CRATER_RADIUS_MULTIPLIER = 8.00D;
+        public static final double BLAST_BOWL_MAX_FALLOUT_RADIUS_RATIO = 0.75D;
+        public static final double BLAST_BOWL_INNER_PROTECTION_PADDING = 3.0D;
+        public static final double BLAST_BOWL_RADIUS_NOISE_STRENGTH = 0.075D;
+        public static final double BLAST_BOWL_CURVE_POWER = 3.35D;
+        public static final double BLAST_BOWL_MAX_RISE_RATIO = 0.68D;
+        public static final double BLAST_BOWL_MAX_RISE_BLOCKS = 512.0D;
+        public static final double BLAST_BOWL_VERTICAL_NOISE_RATIO = 0.035D;
+        public static final int BLAST_CLEAR_ABOVE_RIM_OFFSET = 2;
+
+        /*
+         * Prevents the absolute bowl envelope from slicing a giant one-sided
+         * curved wall through mountains. The bowl may still shave and round
+         * high terrain, but its cut depth is capped relative to each local
+         * ground surface and fades smoothly to zero at the outer boundary.
+         */
+        public static final double BLAST_BOWL_LOCAL_CUT_DEPTH_RATIO = 0.18D;
+        public static final int BLAST_BOWL_LOCAL_CUT_DEPTH_MIN = 12;
+        public static final int BLAST_BOWL_LOCAL_CUT_DEPTH_MAX = 64;
+        public static final double BLAST_BOWL_LOCAL_CUT_TAPER_POWER = 1.35D;
 
         /*
          * Random TNT-style surface pits outside the main crater. Candidate
@@ -242,7 +290,7 @@ public final class DetonationTuning {
 
         public static final float FIREBALL_RADIUS_MULTIPLIER = 1.00F;
         public static final float MINIMUM_FIREBALL_RADIUS = 14.0F;
-        public static final float MAXIMUM_FIREBALL_RADIUS = 300.0F;
+        public static final float MAXIMUM_FIREBALL_RADIUS = 1_024.0F;
 
         public static final double FIREBALL_CAP_SPREAD_START_RATIO = 0.15D;
         public static final float MATURE_CLOUD_RADIUS_MULTIPLIER = 2.80F;
@@ -261,6 +309,11 @@ public final class DetonationTuning {
 
         public static final float STEM_HEIGHT_MULTIPLIER = 4.50F;
         public static final float MINIMUM_STEM_HEIGHT = 48.0F;
+
+        /* Extends the visible stem down to approximately the crater floor. */
+        public static final double STEM_GROUND_EXTENSION_RADIUS_RATIO = 0.34D;
+        public static final double STEM_GROUND_EXTENSION_MINIMUM = 8.0D;
+        public static final double STEM_GROUND_EXTENSION_MAXIMUM = 160.0D;
         public static final float STEM_INITIAL_RADIUS_RATIO = 0.34F;
         public static final float STEM_RADIUS_RATIO = 0.34F;
         public static final double STEM_WIDEN_START_MORPH_RATIO = 0.18D;
@@ -334,6 +387,8 @@ public final class DetonationTuning {
         public static final float MIN_POOF_SCALE = 1.50F;
         public static final float MAX_FIREBALL_POOF_SCALE = 13.0F;
         public static final float MAX_SMOKE_POOF_SCALE = 18.0F;
+        public static final double PARTICLE_OCCLUSION_START_DISTANCE = 96.0D;
+        public static final double PARTICLE_OCCLUSION_SAMPLE_RADIUS_RATIO = 0.58D;
 
         /*
          * Ground and atmospheric waves share the same delay, duration and
@@ -371,9 +426,9 @@ public final class DetonationTuning {
      * Distant Horizons is not installed.</p>
      */
     public static final class DistantHorizons {
-        public static final int CRATER_REFRESH_CHUNKS_PER_TICK = 8;
-        public static final int CRATER_REFRESH_SCAN_PER_TICK = 32;
-        public static final int CRATER_REFRESH_MAX_ATTEMPTS = 200;
+        public static final int CRATER_REFRESH_CHUNKS_PER_TICK = 16;
+        public static final int CRATER_REFRESH_SCAN_PER_TICK = 64;
+        public static final int CRATER_REFRESH_MAX_ATTEMPTS = 1_200;
 
         public static final int CLOUD_FORMING_UPDATE_TICKS = 40;
         public static final int CLOUD_MATURE_UPDATE_TICKS = 200;
@@ -381,6 +436,7 @@ public final class DetonationTuning {
 
         public static final double MINIMUM_CLOUD_LOD_DISTANCE = 256.0D;
         public static final double CLOUD_LOD_DISTANCE_RADIUS_RATIO = 2.25D;
+        public static final double PARTICLE_CULL_CLOUD_RADIUS_MULTIPLIER = 1.65D;
 
         /*
          * DH cloud models use overlapping filled voxel slices rather than
