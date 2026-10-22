@@ -2,6 +2,7 @@ package com.github.loganmartingreen.nucleocraftdetonation.terrain;
 
 import com.github.loganmartingreen.nucleocraftdetonation.block.DetonationBlocks;
 import com.github.loganmartingreen.nucleocraftdetonation.config.DetonationTuning;
+import com.github.loganmartingreen.nucleocraftdetonation.fluid.DetonationFluids;
 import com.github.loganmartingreen.nucleocraftdetonation.persistence.DetonationSavedData.TerrainZone;
 
 import net.minecraft.core.BlockPos;
@@ -9,10 +10,12 @@ import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.tags.BlockTags;
+import net.minecraft.tags.FluidTags;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.RotatedPillarBlock;
+import net.minecraft.world.level.block.LiquidBlock;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.block.state.properties.Property;
 import net.minecraft.world.level.levelgen.Heightmap;
@@ -34,6 +37,8 @@ final class FalloutTerrainChunkTask {
     private static final long VARIANT_ROLL_SALT = 0x510E527FADE682D1L;
     private static final long SECONDARY_BLAST_SALT = 0x1F83D9ABFB41BD6BL;
     private static final long BUILDING_DAMAGE_SALT = 0x5BE0CD19137E2179L;
+    private static final long BAND_BLEND_SALT = 0x243F6A8885A308D3L;
+    private static final long OUTER_FADE_SALT = 0x13198A2E03707344L;
 
     private final TerrainZone zone;
     private final ChunkPos chunkPos;
@@ -238,6 +243,29 @@ final class FalloutTerrainChunkTask {
         }
 
         /*
+         * Fallout water is now a real water-like fluid rather than a client
+         * tint. Preserve the vanilla liquid level when replacing flowing
+         * water so lakes and rivers keep their existing surface shape.
+         */
+        if (
+                state.getFluidState().is(FluidTags.WATER)
+                        && !state.getFluidState().is(DetonationFluids.IRRADIATED_WATER.get())
+                        && !state.getFluidState().is(DetonationFluids.FLOWING_IRRADIATED_WATER.get())
+        ) {
+            BlockState irradiated = DetonationBlocks.IRRADIATED_WATER.get().defaultBlockState();
+            if (
+                    state.hasProperty(LiquidBlock.LEVEL)
+                            && irradiated.hasProperty(LiquidBlock.LEVEL)
+            ) {
+                irradiated = irradiated.setValue(
+                        LiquidBlock.LEVEL,
+                        state.getValue(LiquidBlock.LEVEL)
+                );
+            }
+            return irradiated;
+        }
+
+        /*
          * The blast-bowl has a flat centre and a rapidly rising ellipsoidal
          * edge. Natural terrain above that curved floor is excavated, making a
          * rounded bite in mountains rather than a clean vertical slice. Any
@@ -378,36 +406,22 @@ final class FalloutTerrainChunkTask {
         }
 
         if (isGrassSurface(state)) {
-            double conversionChance = Math.clamp(
-                    DetonationTuning.FalloutTerrain.GROUND_CONVERSION_BASE_CHANCE
-                            + profile.severity
-                            * DetonationTuning.FalloutTerrain.GROUND_CONVERSION_SEVERITY_BONUS
-                            + profile.broadNoise * 0.12D,
-                    0.0D,
-                    1.0D
-            );
-
-            if (random01(x, y, z, BLOCK_ROLL_SALT) > conversionChance) {
+            double coverage = outerFalloutCoverage(x, z, profile);
+            if (coverage <= 0.0D
+                    || random01(x, y, z, OUTER_FADE_SALT) > coverage) {
                 return null;
             }
 
-            double charredChance = smoothstep(
-                    Math.clamp(
-                            (profile.severity
-                                    - DetonationTuning.FalloutTerrain.GROUND_CHAR_START_SEVERITY)
-                                    / DetonationTuning.FalloutTerrain.GROUND_CHAR_SEVERITY_RANGE,
-                            0.0D,
-                            1.0D
-                    )
+            double charred = innerBandWeight(
+                    profile.distanceRatio,
+                    DetonationTuning.FalloutTerrain.CHARRED_SURFACE_END_RATIO
             );
-
-            if (profile.inStoneCore) {
-                charredChance = 1.0D;
+            if (profile.inStoneCore
+                    || random01(x, y, z, GROUND_CHAR_ROLL_SALT) < charred) {
+                return chooseCharredStone(x, y, z);
             }
 
-            return random01(x, y, z, GROUND_CHAR_ROLL_SALT) <= charredChance
-                    ? chooseCharredStone(x, y, z)
-                    : DetonationBlocks.RAD_GRASS.get().defaultBlockState();
+            return DetonationBlocks.RAD_GRASS.get().defaultBlockState();
         }
 
         if (isDirtLike(state)) {
@@ -418,14 +432,11 @@ final class FalloutTerrainChunkTask {
                 return null;
             }
 
-            double chance = Math.clamp(
-                    DetonationTuning.FalloutTerrain.CHARRED_SOIL_BASE_CHANCE
-                            + profile.severity
-                            * DetonationTuning.FalloutTerrain.CHARRED_SOIL_SEVERITY_BONUS,
-                    0.0D,
-                    1.0D
+            double coverage = innerBandWeight(
+                    profile.distanceRatio,
+                    DetonationTuning.FalloutTerrain.CHARRED_SOIL_END_RATIO
             );
-            return random01(x, y, z, BLOCK_ROLL_SALT) <= chance
+            return random01(x, y, z, BAND_BLEND_SALT) < coverage
                     ? DetonationBlocks.CHARRED_DIRT.get().defaultBlockState()
                     : null;
         }
@@ -438,14 +449,11 @@ final class FalloutTerrainChunkTask {
                 return null;
             }
 
-            double chance = Math.clamp(
-                    DetonationTuning.FalloutTerrain.CHARRED_SOIL_BASE_CHANCE
-                            + profile.severity
-                            * DetonationTuning.FalloutTerrain.CHARRED_SOIL_SEVERITY_BONUS,
-                    0.0D,
-                    1.0D
+            double coverage = innerBandWeight(
+                    profile.distanceRatio,
+                    DetonationTuning.FalloutTerrain.CHARRED_SOIL_END_RATIO
             );
-            return random01(x, y, z, BLOCK_ROLL_SALT + 17L) <= chance
+            return random01(x, y, z, BAND_BLEND_SALT + 17L) < coverage
                     ? DetonationBlocks.CHARRED_SAND.get().defaultBlockState()
                     : null;
         }
@@ -458,15 +466,11 @@ final class FalloutTerrainChunkTask {
                 return null;
             }
 
-            double chance = Math.clamp(
-                    profile.severity
-                            * profile.severity
-                            * DetonationTuning.FalloutTerrain.OUTER_STONE_MAX_CHANCE
-                            + profile.detailNoise * 0.06D,
-                    0.0D,
-                    1.0D
+            double coverage = innerBandWeight(
+                    profile.distanceRatio,
+                    DetonationTuning.FalloutTerrain.CHARRED_STONE_END_RATIO
             );
-            return random01(x, y, z, BLOCK_ROLL_SALT) <= chance
+            return random01(x, y, z, BAND_BLEND_SALT + 31L) < coverage
                     ? chooseCharredStone(x, y, z)
                     : null;
         }
@@ -528,6 +532,48 @@ final class FalloutTerrainChunkTask {
                 : null;
     }
 
+    private double innerBandWeight(
+            double distanceRatio,
+            double bandEndRatio
+    ) {
+        double halfBlend = DetonationTuning.FalloutTerrain.BAND_BLEND_WIDTH_RATIO * 0.5D;
+        double inner = bandEndRatio - halfBlend;
+        double outer = bandEndRatio + halfBlend;
+        if (distanceRatio <= inner) {
+            return 1.0D;
+        }
+        if (distanceRatio >= outer) {
+            return 0.0D;
+        }
+        return 1.0D - smoothstep((distanceRatio - inner) / Math.max(0.0001D, outer - inner));
+    }
+
+    private double outerFalloutCoverage(
+            int x,
+            int z,
+            ColumnProfile profile
+    ) {
+        double start = DetonationTuning.FalloutTerrain.OUTER_RAD_GRASS_FADE_START_RATIO;
+        if (profile.distanceRatio <= start) {
+            return 1.0D;
+        }
+        if (profile.distanceRatio >= 1.0D) {
+            return 0.0D;
+        }
+
+        double radial = 1.0D - smoothstep(
+                (profile.distanceRatio - start) / Math.max(0.0001D, 1.0D - start)
+        );
+        double edgeNoise = valueNoise(
+                zone.effectId() ^ OUTER_FADE_SALT,
+                x,
+                z,
+                DetonationTuning.FalloutTerrain.OUTER_RAD_GRASS_NOISE_SCALE
+        ) * DetonationTuning.FalloutTerrain.OUTER_RAD_GRASS_NOISE_STRENGTH;
+
+        return Math.clamp(radial + edgeNoise * radial * (1.0D - radial), 0.0D, 1.0D);
+    }
+
     private BlockState chooseCharredStone(int x, int y, int z) {
         return random01(x, y, z, VARIANT_ROLL_SALT)
                 < DetonationTuning.FalloutTerrain.CHARRED_STONE_0_RATIO
@@ -557,15 +603,15 @@ final class FalloutTerrainChunkTask {
                 DetonationTuning.FalloutTerrain.DETAIL_NOISE_SCALE
         );
 
-        double effectiveDistanceRatio =
-                distance / zone.falloutRadius()
-                        + broadNoise
-                        * DetonationTuning.FalloutTerrain.BROAD_NOISE_EDGE_STRENGTH
-                        + detailNoise
-                        * DetonationTuning.FalloutTerrain.DETAIL_NOISE_EDGE_STRENGTH;
+        /* Fallout level boundaries are intentionally circular. */
+        double distanceRatio = Math.clamp(
+                distance / Math.max(1.0D, zone.falloutRadius()),
+                0.0D,
+                1.0D
+        );
 
         double severity = smoothstep(
-                Math.clamp(1.0D - effectiveDistanceRatio, 0.0D, 1.0D)
+                Math.clamp(1.0D - distanceRatio, 0.0D, 1.0D)
         );
 
         double coreRadius = Math.max(
@@ -683,6 +729,7 @@ final class FalloutTerrainChunkTask {
 
         return new ColumnProfile(
                 severity,
+                distanceRatio,
                 broadNoise,
                 detailNoise,
                 distance <= coreRadius,
@@ -1182,6 +1229,7 @@ final class FalloutTerrainChunkTask {
 
     private record ColumnProfile(
             double severity,
+            double distanceRatio,
             double broadNoise,
             double detailNoise,
             boolean inStoneCore,
@@ -1193,6 +1241,7 @@ final class FalloutTerrainChunkTask {
     ) {
         private static final ColumnProfile OUTSIDE = new ColumnProfile(
                 0.0D,
+                1.0D,
                 0.0D,
                 0.0D,
                 false,

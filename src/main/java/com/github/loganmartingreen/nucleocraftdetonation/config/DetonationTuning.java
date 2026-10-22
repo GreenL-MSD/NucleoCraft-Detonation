@@ -29,17 +29,16 @@ public final class DetonationTuning {
         public static final int MINIMUM_DEPTH_BLOCKS = 9;
 
         public static final double RIM_WIDTH_BASE = 2.0D;
-        public static final int MINIMUM_RIM_WIDTH = 6;
-        public static final int MAXIMUM_RIM_WIDTH = 10;
+        public static final int MINIMUM_RIM_WIDTH = 2;
+        public static final int MAXIMUM_RIM_WIDTH = 4;
 
         /*
-         * The original implementation effectively produced a three-block rim
-         * height for every supported yield. These values preserve that tested
-         * appearance while making the behaviour explicit and easy to change.
+         * Yield-scaled rim dimensions with hard visual caps. The main crater
+         * bowl is unchanged; only the raised edge is constrained here.
          */
-        public static final double RIM_HEIGHT_BASE = 5.0D;
-        public static final int MINIMUM_RIM_HEIGHT = 1;
-        public static final int MAXIMUM_RIM_HEIGHT = 3;
+        public static final double RIM_HEIGHT_BASE = 2.0D;
+        public static final int MINIMUM_RIM_HEIGHT = 2;
+        public static final int MAXIMUM_RIM_HEIGHT = 5;
 
         private CraterScale() {
         }
@@ -76,7 +75,6 @@ public final class DetonationTuning {
 
         public static final double SKY_COLOUR_STRENGTH = 1.0D;
         public static final double CLOUD_COLOUR_STRENGTH = 0.85D;
-        public static final float WATER_COLOUR_STRENGTH = 1.0F;
 
         public static final int MAX_DUST_PARTICLES_PER_TICK = 7;
         public static final double DUST_HORIZONTAL_RADIUS = 24.0D;
@@ -130,8 +128,19 @@ public final class DetonationTuning {
         public static final int SURFACE_STONE_DEPTH = 6;
         public static final int CHARRED_DIRT_DEPTH = 8;
         public static final int CHARRED_SAND_DEPTH = 12;
-        public static final double CHARRED_SOIL_BASE_CHANCE = 0.72D;
-        public static final double CHARRED_SOIL_SEVERITY_BONUS = 0.28D;
+
+        /*
+         * Fallout terrain bands are circular. Noise no longer changes the
+         * radius of a band; deterministic dithering is used only inside the
+         * narrow transition strips and the final irradiated-grass fade.
+         */
+        public static final double CHARRED_SURFACE_END_RATIO = 0.56D;
+        public static final double CHARRED_SOIL_END_RATIO = 0.78D;
+        public static final double CHARRED_STONE_END_RATIO = 0.62D;
+        public static final double BAND_BLEND_WIDTH_RATIO = 0.045D;
+        public static final double OUTER_RAD_GRASS_FADE_START_RATIO = 0.90D;
+        public static final double OUTER_RAD_GRASS_NOISE_SCALE = 17.0D;
+        public static final double OUTER_RAD_GRASS_NOISE_STRENGTH = 0.16D;
 
         public static final double REFERENCE_CRATER_RADIUS_BLOCKS = 32.0D;
 
@@ -145,16 +154,9 @@ public final class DetonationTuning {
 
         public static final double BROAD_NOISE_SCALE = 82.0D;
         public static final double DETAIL_NOISE_SCALE = 23.0D;
-        public static final double BROAD_NOISE_EDGE_STRENGTH = 0.095D;
-        public static final double DETAIL_NOISE_EDGE_STRENGTH = 0.035D;
 
         public static final double CHARRED_STONE_0_RATIO = 0.60D;
 
-        public static final double GROUND_CONVERSION_BASE_CHANCE = 0.22D;
-        public static final double GROUND_CONVERSION_SEVERITY_BONUS = 0.95D;
-        public static final double GROUND_CHAR_START_SEVERITY = 0.28D;
-        public static final double GROUND_CHAR_SEVERITY_RANGE = 0.58D;
-        public static final double OUTER_STONE_MAX_CHANCE = 0.78D;
 
         public static final double LOG_CONVERSION_BASE_CHANCE = 0.62D;
         public static final double LOG_CONVERSION_SEVERITY_BONUS = 0.45D;

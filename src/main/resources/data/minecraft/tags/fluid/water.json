@@ -1,0 +1,7 @@
+{
+  "replace": false,
+  "values": [
+    "nucleocraft_detonation:irradiated_water",
+    "nucleocraft_detonation:flowing_irradiated_water"
+  ]
+}

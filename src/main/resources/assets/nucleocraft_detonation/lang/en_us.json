@@ -8,5 +8,7 @@
   "block.nucleocraft_detonation.charred_plank_stairs": "Charred Plank Stairs",
   "block.nucleocraft_detonation.charred_plank_slab": "Charred Plank Slab",
   "block.nucleocraft_detonation.charred_dirt": "Charred Dirt",
-  "block.nucleocraft_detonation.charred_sand": "Charred Sand"
+  "block.nucleocraft_detonation.charred_sand": "Charred Sand",
+  "block.nucleocraft_detonation.irradiated_water": "Irradiated Water",
+  "fluid.nucleocraft_detonation.irradiated_water": "Irradiated Water"
 }

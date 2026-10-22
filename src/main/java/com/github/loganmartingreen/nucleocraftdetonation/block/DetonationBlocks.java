@@ -1,12 +1,14 @@
 package com.github.loganmartingreen.nucleocraftdetonation.block;
 
 import com.github.loganmartingreen.nucleocraftdetonation.NucleoCraftDetonation;
+import com.github.loganmartingreen.nucleocraftdetonation.fluid.DetonationFluids;
 
 import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.CreativeModeTabs;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.RotatedPillarBlock;
+import net.minecraft.world.level.block.LiquidBlock;
 import net.minecraft.world.level.block.SlabBlock;
 import net.minecraft.world.level.block.StairBlock;
 import net.minecraft.world.level.block.state.BlockBehaviour;
@@ -77,6 +79,16 @@ public final class DetonationBlocks {
             BLOCKS.registerSimpleBlock(
                     "rad_grass",
                     BlockBehaviour.Properties.ofFullCopy(Blocks.GRASS_BLOCK)
+            );
+
+    public static final DeferredBlock<LiquidBlock> IRRADIATED_WATER =
+            BLOCKS.registerBlock(
+                    "irradiated_water",
+                    properties -> new LiquidBlock(
+                            DetonationFluids.IRRADIATED_WATER.get(),
+                            properties
+                    ),
+                    BlockBehaviour.Properties.ofFullCopy(Blocks.WATER)
             );
 
     public static final DeferredBlock<RotatedPillarBlock> CHARRED_LOG =

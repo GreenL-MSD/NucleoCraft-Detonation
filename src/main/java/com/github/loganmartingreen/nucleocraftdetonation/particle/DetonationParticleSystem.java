@@ -3,6 +3,7 @@ package com.github.loganmartingreen.nucleocraftdetonation.particle;
 import com.github.loganmartingreen.nucleocraftdetonation.NucleoCraftDetonation;
 import com.github.loganmartingreen.nucleocraftdetonation.compat.distanthorizons.DistantHorizonsCompat;
 import com.github.loganmartingreen.nucleocraftdetonation.config.DetonationTuning;
+import com.github.loganmartingreen.nucleocraftdetonation.config.DetonationClientConfig;
 import com.github.loganmartingreen.nucleocraftdetonation.particle.DetonationParticles.TintedPoofOptions;
 
 import net.minecraft.client.Minecraft;
@@ -145,7 +146,12 @@ public final class DetonationParticleSystem {
                     cloud.centreZ,
                     cloud.visualScale
             );
-            cloud.detailedParticlesVisible = !distantLodActive
+            boolean particleRendererSelected =
+                    DetonationClientConfig.mushroomCloudRenderer()
+                            == DetonationClientConfig.MushroomCloudRenderer.PARTICLES;
+
+            cloud.detailedParticlesVisible = particleRendererSelected
+                    && !distantLodActive
                     && hasCloudLineOfSight(minecraft, cloud);
 
             if (

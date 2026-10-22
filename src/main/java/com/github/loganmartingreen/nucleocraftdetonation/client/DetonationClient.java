@@ -68,7 +68,6 @@ public final class DetonationClient {
     private static ClientLevel previousLevel;
     private static PersistentVisualSyncPayload pendingPersistentSync;
     private static float currentFalloutIntensity;
-    private static int previousWaterTintStage = -1;
     private static boolean distantHorizonsPresenceSent;
 
     private DetonationClient() {
@@ -246,7 +245,7 @@ public final class DetonationClient {
     }
 
     /**
-     * Used by the sky and water mixins.
+     * Used by the sky mixin and fallout visual systems.
      */
     public static float falloutIntensity() {
         return Math.clamp(
@@ -313,11 +312,6 @@ public final class DetonationClient {
         DetonationShockwaveRenderer.tick();
 
         float intensity = falloutIntensity();
-
-        refreshWaterTintWhenNeeded(
-                minecraft,
-                intensity
-        );
 
         if (intensity > 0.001F) {
             spawnFalloutDust(
@@ -704,36 +698,6 @@ public final class DetonationClient {
         );
     }
 
-    private static void refreshWaterTintWhenNeeded(
-            Minecraft minecraft,
-            float intensity
-    ) {
-        if (minecraft.level == null) {
-            previousWaterTintStage = -1;
-            return;
-        }
-
-        int tintStage;
-
-        if (intensity <= 0.001F) {
-            tintStage = 0;
-        } else if (intensity < 0.35F) {
-            tintStage = 1;
-        } else if (intensity < 0.80F) {
-            tintStage = 2;
-        } else {
-            tintStage = 3;
-        }
-
-        if (tintStage == previousWaterTintStage) {
-            return;
-        }
-
-        previousWaterTintStage = tintStage;
-        minecraft.level.clearTintCaches();
-        minecraft.levelRenderer.allChanged();
-    }
-
     private static void spawnFalloutDust(
             ClientLevel level,
             Minecraft minecraft,
@@ -835,7 +799,6 @@ public final class DetonationClient {
         DistantHorizonsCompat.clear();
 
         currentFalloutIntensity = 0.0F;
-        previousWaterTintStage = -1;
     }
 
     private static final class FalloutZone {
