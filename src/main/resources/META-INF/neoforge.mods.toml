@@ -6,7 +6,7 @@ license="All Rights Reserved"
 modId="nucleocraft_detonation"
 version="0.2.0"
 displayName="NucleoCraft: Detonation"
-authors="Logan Martin Green"
+authors="TheCaptain."
 description='''
 Yield-scaled nuclear detonations with animated crater generation,
 fallout atmosphere, persistent charred terrain, a blinding flash and distance-delayed blast audio.

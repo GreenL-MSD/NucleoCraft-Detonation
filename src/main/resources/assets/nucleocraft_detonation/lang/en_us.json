@@ -10,5 +10,8 @@
   "block.nucleocraft_detonation.charred_dirt": "Charred Dirt",
   "block.nucleocraft_detonation.charred_sand": "Charred Sand",
   "block.nucleocraft_detonation.irradiated_water": "Irradiated Water",
-  "fluid.nucleocraft_detonation.irradiated_water": "Irradiated Water"
+  "fluid.nucleocraft_detonation.irradiated_water": "Irradiated Water",
+  "block.nucleocraft_detonation.irradiated_ore": "Irradiated Ore",
+  "itemGroup.nucleocraft_detonation.main": "NucleoCraft: Detonation",
+  "block.nucleocraft_detonation.charred_gravel": "Charred Gravel"
 }
