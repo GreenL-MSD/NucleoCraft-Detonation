@@ -37,29 +37,10 @@ public final class DetonationTuning {
         public static final double FULL_STRENGTH_RADIUS_RATIO = 1.00D;
         public static final float INTENSITY_SMOOTHING = 0.14F;
 
-        /* Fog is deliberately darker than the irradiated-water tint. */
-        public static final float FOG_RED = 44.0F / 255.0F;
-        public static final float FOG_GREEN = 54.0F / 255.0F;
-        public static final float FOG_BLUE = 45.0F / 255.0F;
-        public static final float FOG_COLOUR_STRENGTH = 0.84F;
-        /* Vanilla/near fog: use a hard distance cap so high render distance
-         * does not push the fallout wall hundreds of blocks away. */
-        public static final float FOG_END_DISTANCE_BLOCKS = 120.0F;
-        public static final float FOG_MIN_END_DISTANCE_BLOCKS = 72.0F;
-        public static final float FOG_END_RENDER_RATIO = 0.60F;
-        public static final float FOG_START_RATIO = 0.18F;
-
-        /* Distant Horizons fog values are normalized to the vanilla render
-         * distance. These deliberately overlap vanilla fog so there is no
-         * clear LOD band when DH is enabled. */
-        public static final double DH_FOG_START = 0.10D;
-        public static final double DH_FOG_END = 0.68D;
-        public static final double DH_FOG_MIN_THICKNESS = 0.02D;
-        public static final double DH_FOG_MAX_THICKNESS = 0.88D;
-        public static final double DH_FOG_DENSITY = 1.45D;
-
-        public static final double SKY_COLOUR_STRENGTH = 1.0D;
-        public static final double CLOUD_COLOUR_STRENGTH = 0.85D;
+        // Muted olive-grey fallout atmosphere. The sky retains natural
+        // lighting, but no longer trends too far toward blue at full fallout.
+        public static final double SKY_COLOUR_STRENGTH = 0.84D;
+        public static final double CLOUD_COLOUR_STRENGTH = 0.50D;
 
         public static final int MAX_DUST_PARTICLES_PER_TICK = 12;
         public static final double DUST_HORIZONTAL_RADIUS = 24.0D;
@@ -77,11 +58,11 @@ public final class DetonationTuning {
         public static final double FULL_FLASH_RADIUS_RATIO = 0.30D;
 
         public static final double FLASH_RADIUS_MULTIPLIER = 50.0D;
-        public static final float MINIMUM_FLASH_RADIUS = 1_500.0F;
+        public static final float MINIMUM_FLASH_RADIUS = 650.0F;
         public static final float MAXIMUM_FLASH_RADIUS = 24_000.0F;
 
         public static final double SOUND_RADIUS_MULTIPLIER = 80.0D;
-        public static final float MINIMUM_SOUND_RADIUS = 2_500.0F;
+        public static final float MINIMUM_SOUND_RADIUS = 1_000.0F;
         public static final float MAXIMUM_SOUND_RADIUS = 36_000.0F;
 
         public static final float STRENGTH = 1.0F;
@@ -111,7 +92,7 @@ public final class DetonationTuning {
          * The fireball is the cloud head. It rises slowly, darkens and widens
          * into the mushroom shape instead of spawning a separate cap.
          */
-        public static final int FIREBALL_COLOUR_TRANSITION_TICKS = 600;
+        public static final int FIREBALL_COLOUR_TRANSITION_TICKS = 1_750;
         public static final int FIREBALL_ASCENT_BASE_TICKS = 1_800;
         public static final double FIREBALL_ASCENT_TICKS_PER_SCALE = 2.50D;
         public static final int MAX_FIREBALL_ASCENT_TICKS = 2_600;
@@ -122,12 +103,22 @@ public final class DetonationTuning {
         public static final float MINIMUM_FIREBALL_RADIUS = 14.0F;
         public static final float MAXIMUM_FIREBALL_RADIUS = 1_024.0F;
 
-        /* The cap begins compact, stays restrained through the screen flash,
-         * then rapidly blooms to the legacy starting radius. */
+        /* The cap begins compact and rapidly blooms soon after ignition;
+         * flash hold/fade timing is controlled independently. */
         public static final double EARLY_CAP_INITIAL_RADIUS_RATIO = 0.38D;
-        public static final int EARLY_CAP_BLOOM_START_TICKS =
-                ImmediateEffects.FLASH_HOLD_TICKS + ImmediateEffects.FLASH_FADE_TICKS;
-        public static final int EARLY_CAP_BLOOM_DURATION_TICKS = 20 * 5;
+        /* v42.4: expansion starts promptly, independently of screen flash. */
+        public static final int EARLY_CAP_BLOOM_START_TICKS = 28;
+        public static final int EARLY_CAP_BLOOM_DURATION_TICKS = 38;
+
+        /* A buried breakout keeps the fireball compact while it races up the
+         * excavation throat. Once clear of the surface it enters the same
+         * rapid pre-cap bloom as a normal surface shot. */
+        public static final double BREAKOUT_FIREBALL_SPEED_BLOCKS_PER_TICK = 1.35D;
+        public static final double BREAKOUT_FIREBALL_TRAVEL_RADIUS_RATIO = 0.14D;
+        public static final int BREAKOUT_PRECAP_BLOOM_TICKS = 10;
+        public static final int BREAKOUT_FIREBALL_MINIMUM_TRAVEL_TICKS = 8;
+        public static final int BREAKOUT_FIREBALL_MAXIMUM_TRAVEL_TICKS = 80;
+        public static final double BREAKOUT_FIREBALL_SURFACE_CLEARANCE_BLOCKS = 4.0D;
 
         public static final double FIREBALL_CAP_SPREAD_START_RATIO = 0.15D;
         public static final float MATURE_CLOUD_RADIUS_MULTIPLIER = 2.80F;
@@ -200,7 +191,7 @@ public final class DetonationTuning {
          * reached full height. Particle density and size ramp up gradually so
          * the ring fades in rather than appearing in a single tick.
          */
-        public static final int CAP_UNDERSIDE_RING_FADE_IN_TICKS = 20 * 8;
+        public static final int CAP_UNDERSIDE_RING_FADE_IN_TICKS = 20 * 16;
         public static final double CAP_UNDERSIDE_RING_RADIUS_RATIO = 0.50D;
         public static final double CAP_UNDERSIDE_RING_MINIMUM_RADIUS = 4.0D;
         public static final double CAP_UNDERSIDE_RING_THICKNESS_RATIO = 0.13D;
@@ -218,9 +209,13 @@ public final class DetonationTuning {
          * continuing to spawn formation-density particle counts.
          */
         public static final int MATURE_CLOUD_START_TICKS = 2_800;
+        public static final double STEM_DISSIPATION_START_FRACTION = 0.85D;
+        public static final double STEM_DISSIPATION_END_FRACTION = 0.94D;
+        public static final double CAP_DISSIPATION_START_FRACTION = 0.94D;
+        public static final double CAP_DISSIPATION_END_FRACTION = 1.0D;
         public static final int MATURE_GREY_LIGHTEN_DURATION_TICKS = 20 * 60;
-        public static final int MATURE_HEAD_PARTICLES_PER_TICK = 10;
-        public static final int MATURE_STEM_PARTICLES_PER_TICK = 4;
+        public static final int MATURE_HEAD_PARTICLES_PER_TICK = 14;
+        public static final int MATURE_STEM_PARTICLES_PER_TICK = 6;
         public static final int MATURE_PARTICLE_LIFETIME_MIN = 300;
         public static final int MATURE_PARTICLE_LIFETIME_VARIATION = 180;
 

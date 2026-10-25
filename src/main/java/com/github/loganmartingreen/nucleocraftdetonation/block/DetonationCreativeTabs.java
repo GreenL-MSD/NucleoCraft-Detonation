@@ -33,6 +33,7 @@ public final class DetonationCreativeTabs {
                         output.accept(DetonationBlocks.CHARRED_STONE_0_ITEM.get());
                         output.accept(DetonationBlocks.CHARRED_STONE_1_ITEM.get());
                         output.accept(DetonationBlocks.IRRADIATED_ORE_ITEM.get());
+                        output.accept(DetonationBlocks.IRRADIATED_WATER_BUCKET.get());
                         output.accept(DetonationBlocks.CHARRED_DIRT_ITEM.get());
                         output.accept(DetonationBlocks.CHARRED_SAND_ITEM.get());
                         output.accept(DetonationBlocks.CHARRED_GRAVEL_ITEM.get());

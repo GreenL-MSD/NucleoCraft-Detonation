@@ -16,12 +16,18 @@ public final class BlastDamageRules {
                 <= TerrainGenerationTuning.Fallout.WATER_EVAPORATION_END_RATIO;
     }
 
-    public static double treeCutRadius(double craterRadius) {
+    public static double treeCutRadius(
+            double craterRadius,
+            double surfaceFalloutStrength
+    ) {
         double yieldScale = craterRadius
                 / TerrainGenerationTuning.Fallout.REFERENCE_CRATER_RADIUS_BLOCKS;
+        double surfaceCoupling = 0.35D
+                + 0.65D * Math.clamp(surfaceFalloutStrength, 0.0D, 1.0D);
         return craterRadius
                 + TerrainGenerationTuning.Fallout.TREE_CUT_EDGE_DISTANCE_AT_REFERENCE
-                * yieldScale;
+                * yieldScale
+                * surfaceCoupling;
     }
 
     public static int allowedStumpHeight(

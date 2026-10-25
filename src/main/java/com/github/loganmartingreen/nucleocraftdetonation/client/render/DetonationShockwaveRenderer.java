@@ -57,6 +57,7 @@ public final class DetonationShockwaveRenderer {
             float visualScale,
             float strength
     ) {
+        if (strength <= 0.001F) return;
         ACTIVE_SHOCKWAVES.add(
                 new ActiveShockwave(
                         centreX,

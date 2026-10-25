@@ -11,6 +11,7 @@ public final class DetonationClientConfig {
 
     public static final ModConfigSpec SPEC;
     public static final ModConfigSpec.EnumValue<MushroomCloudRenderer> MUSHROOM_CLOUD_RENDERER;
+    public static final ModConfigSpec.BooleanValue FALLOUT_VANILLA_FOG_TINT;
 
     static {
         ModConfigSpec.Builder builder = new ModConfigSpec.Builder();
@@ -26,11 +27,22 @@ public final class DetonationClientConfig {
                         "mushroomCloudRenderer",
                         MushroomCloudRenderer.PARTICLES
                 );
+        FALLOUT_VANILLA_FOG_TINT = builder
+                .comment(
+                        "Tint only Minecraft's pre-existing fog colour when standing in fallout.",
+                        "Does not modify fog distance, density or Distant Horizons fog settings.",
+                        "Some DH fog presets may sample Minecraft's world fog colour."
+                )
+                .define("falloutVanillaFogTint", true);
         builder.pop();
         SPEC = builder.build();
     }
 
     private DetonationClientConfig() {
+    }
+
+    public static boolean falloutVanillaFogTint() {
+        return FALLOUT_VANILLA_FOG_TINT.get();
     }
 
     public static MushroomCloudRenderer mushroomCloudRenderer() {

@@ -208,15 +208,20 @@ final class FalloutChunkProcessor {
                 startingY - TerrainGenerationTuning.Fallout.GROUND_SEARCH_DEPTH
         );
 
+        int lowestIce = -1;
         for (int y = startingY; y >= minimum; y--) {
             cursor.set(x, y, z);
             BlockState state = level.getBlockState(cursor);
-            if (isNaturalTerrainFoundation(state)) {
+            // Search past tall ice spikes to the real ground so the ENTIRE
+            // formation is scanned. If there is only ice, fall back to it.
+            if (isFrozenWater(state) || state.is(Blocks.SNOW_BLOCK)) lowestIce = y;
+            if (isNaturalTerrainFoundation(state)
+                    && !isFrozenWater(state) && !state.is(Blocks.SNOW_BLOCK)) {
                 return y;
             }
         }
 
-        return -1;
+        return lowestIce;
     }
 
     private void advanceColumn() {
@@ -253,9 +258,10 @@ final class FalloutChunkProcessor {
                 profile.distanceRatio
         );
 
-        /* Frozen water evaporates centrally, becomes irradiated through most
-         * of the fallout zone, then fades irregularly back to untouched ice at
-         * the outer edge instead of ending on a perfect circle. */
+        /* Frozen water (including packed and blue ice) is processed even when
+         * an ice formation forms the top of a column. Near ground zero it
+         * evaporates; farther out it converts to irradiated water with a noisy
+         * contamination edge, instead of leaving pristine ice spires. */
         if (state.is(Blocks.ICE)
                 || state.is(Blocks.PACKED_ICE)
                 || state.is(Blocks.BLUE_ICE)
@@ -275,13 +281,18 @@ final class FalloutChunkProcessor {
          * that band it still becomes irradiated water, preserving the vanilla
          * liquid level so the outer contaminated water body keeps its shape.
          */
-        if (
-                state.getFluidState().is(FluidTags.WATER)
-                        && !state.getFluidState().is(DetonationFluids.IRRADIATED_WATER.get())
-                        && !state.getFluidState().is(DetonationFluids.FLOWING_IRRADIATED_WATER.get())
-        ) {
+        if (state.getFluidState().is(FluidTags.WATER)
+                || state.getFluidState().is(DetonationFluids.IRRADIATED_WATER.get())
+                || state.getFluidState().is(DetonationFluids.FLOWING_IRRADIATED_WATER.get())) {
+            // Sources and flowing irradiated water evaporate in precisely the
+            // same hot-zone radius as ordinary water. Do not convert it back
+            // into itself outside the hot band.
             if (evaporateWater) {
                 return Blocks.AIR.defaultBlockState();
+            }
+            if (state.getFluidState().is(DetonationFluids.IRRADIATED_WATER.get())
+                    || state.getFluidState().is(DetonationFluids.FLOWING_IRRADIATED_WATER.get())) {
+                return null;
             }
 
             double coverage = outerWaterContaminationCoverage(x, z, profile);
@@ -333,6 +344,28 @@ final class FalloutChunkProcessor {
             );
             return random01(x, y, z, BAND_BLEND_SALT + 43L) < coverage
                     ? DetonationBlocks.CHARRED_GRAVEL.get().defaultBlockState()
+                    : null;
+        }
+
+        /* Clay is temporarily treated as thermally fused ground and becomes
+         * the regular Charred Stone material through the stone-depth profile. */
+        if (state.is(Blocks.CLAY) && y <= groundY) {
+            int charredStoneDepth = radialCharredStoneDepth(profile);
+            if (profile.inStoneCore) {
+                charredStoneDepth = Math.max(charredStoneDepth, replacementDepth);
+            }
+            if (charredStoneDepth <= 0 || currentTerrainDepth >= charredStoneDepth) {
+                return null;
+            }
+
+            double coverage = profile.inStoneCore
+                    ? 1.0D
+                    : innerBandWeight(
+                    profile.distanceRatio,
+                    TerrainGenerationTuning.Fallout.CHARRED_STONE_END_RATIO
+            );
+            return random01(x, y, z, BAND_BLEND_SALT + 53L) < coverage
+                    ? DetonationBlocks.CHARRED_STONE_0.get().defaultBlockState()
                     : null;
         }
 
@@ -693,14 +726,19 @@ final class FalloutChunkProcessor {
                 0.0D,
                 1.0D
         );
-        double severity = smoothstep(Math.clamp(1.0D - distanceRatio, 0.0D, 1.0D));
+        double severity = smoothstep(
+                Math.clamp(1.0D - distanceRatio, 0.0D, 1.0D)
+        ) * Math.clamp(zone.falloutStrength(), 0.0F, 1.0F);
 
         double coreRadius = Math.max(
                 zone.visualScale() + TerrainGenerationTuning.Fallout.STONE_CORE_RADIUS_PADDING,
                 zone.visualScale() * TerrainGenerationTuning.Fallout.STONE_CORE_RADIUS_MULTIPLIER
         );
 
-        double treeCutRadius = BlastDamageRules.treeCutRadius(zone.visualScale());
+        double treeCutRadius = BlastDamageRules.treeCutRadius(
+                zone.visualScale(),
+                zone.falloutStrength()
+        );
         boolean inTreeCutZone = distance <= treeCutRadius;
         int allowedStumpHeight = BlastDamageRules.allowedStumpHeight(
                 distance,
@@ -876,6 +914,11 @@ final class FalloutChunkProcessor {
         return !isFalloutBlock(state);
     }
 
+    private static boolean isFrozenWater(BlockState state) {
+        return state.is(Blocks.ICE) || state.is(Blocks.PACKED_ICE)
+                || state.is(Blocks.BLUE_ICE) || state.is(Blocks.FROSTED_ICE);
+    }
+
     private static boolean isNaturalTerrainFoundation(BlockState state) {
         return isGrassSurface(state)
                 || isDirtLike(state)
@@ -886,6 +929,8 @@ final class FalloutChunkProcessor {
                 || state.is(Blocks.GRAVEL)
                 || state.is(Blocks.CLAY)
                 || state.is(Blocks.SNOW_BLOCK)
+                || state.is(Blocks.ICE) || state.is(Blocks.PACKED_ICE)
+                || state.is(Blocks.BLUE_ICE) || state.is(Blocks.FROSTED_ICE)
                 || state.is(DetonationBlocks.RAD_GRASS.get())
                 || state.is(DetonationBlocks.CHARRED_STONE_0.get())
                 || state.is(DetonationBlocks.CHARRED_STONE_1.get())
@@ -960,6 +1005,8 @@ final class FalloutChunkProcessor {
                 || state.is(Blocks.GRAVEL)
                 || state.is(Blocks.CLAY)
                 || state.is(Blocks.SNOW_BLOCK)
+                || state.is(Blocks.ICE) || state.is(Blocks.PACKED_ICE)
+                || state.is(Blocks.BLUE_ICE) || state.is(Blocks.FROSTED_ICE)
                 || state.is(DetonationBlocks.RAD_GRASS.get())
                 || state.is(DetonationBlocks.CHARRED_STONE_0.get())
                 || state.is(DetonationBlocks.CHARRED_STONE_1.get())

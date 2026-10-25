@@ -39,7 +39,7 @@ public final class DetonationNetwork {
             RegisterPayloadHandlersEvent event
     ) {
         PayloadRegistrar registrar =
-                event.registrar("5");
+                event.registrar("7");
 
         registrar.playToClient(
                 FalloutVisualPayload.TYPE,
@@ -70,6 +70,9 @@ public final class DetonationNetwork {
                 TerrainChunkLodRefreshPayload.STREAM_CODEC,
                 DetonationNetwork::handleTerrainChunkLodRefresh
         );
+
+        registrar.playToClient(DebugModePayload.TYPE, DebugModePayload.STREAM_CODEC,
+                DetonationNetwork::handleDebugMode);
 
         registrar.playToClient(
                 ClearMushroomCloudsPayload.TYPE,
@@ -132,6 +135,11 @@ public final class DetonationNetwork {
         );
     }
 
+    private static void handleDebugMode(DebugModePayload payload, IPayloadContext context) {
+        com.github.loganmartingreen.nucleocraftdetonation.particle.DetonationParticleSystem
+                .setDebugMode(payload.enabled());
+    }
+
     private static void handleClearMushroomClouds(
             ClearMushroomCloudsPayload payload,
             IPayloadContext context
@@ -165,6 +173,15 @@ public final class DetonationNetwork {
                     payload.chunkZ()
             );
         }
+    }
+
+    public record DebugModePayload(boolean enabled) implements CustomPacketPayload {
+        public static final Type<DebugModePayload> TYPE = new Type<>(
+                ResourceLocation.fromNamespaceAndPath(NucleoCraftDetonation.MOD_ID, "debug_mode"));
+        public static final StreamCodec<RegistryFriendlyByteBuf, DebugModePayload> STREAM_CODEC =
+                StreamCodec.composite(ByteBufCodecs.BOOL, DebugModePayload::enabled, DebugModePayload::new);
+        @Override
+        public Type<? extends CustomPacketPayload> type() { return TYPE; }
     }
 
     public record ClearMushroomCloudsPayload(
@@ -267,7 +284,10 @@ public final class DetonationNetwork {
             float flashRadius,
             float soundRadius,
             float visualScale,
-            float strength
+            float strength,
+            int cloudExitY,
+            float shockwaveStrength,
+            boolean subterranean
     ) implements CustomPacketPayload {
         public static final Type<DetonationEffectsPayload> TYPE =
                 new Type<>(
@@ -281,24 +301,36 @@ public final class DetonationNetwork {
                 RegistryFriendlyByteBuf,
                 DetonationEffectsPayload
                 > STREAM_CODEC =
-                StreamCodec.composite(
-                        BlockPos.STREAM_CODEC,
-                        DetonationEffectsPayload::centre,
+                new StreamCodec<>() {
+                    @Override
+                    public DetonationEffectsPayload decode(RegistryFriendlyByteBuf buffer) {
+                        return new DetonationEffectsPayload(
+                                BlockPos.STREAM_CODEC.decode(buffer),
+                                buffer.readFloat(),
+                                buffer.readFloat(),
+                                buffer.readFloat(),
+                                buffer.readFloat(),
+                                buffer.readVarInt(),
+                                buffer.readFloat(),
+                                buffer.readBoolean()
+                        );
+                    }
 
-                        ByteBufCodecs.FLOAT,
-                        DetonationEffectsPayload::flashRadius,
-
-                        ByteBufCodecs.FLOAT,
-                        DetonationEffectsPayload::soundRadius,
-
-                        ByteBufCodecs.FLOAT,
-                        DetonationEffectsPayload::visualScale,
-
-                        ByteBufCodecs.FLOAT,
-                        DetonationEffectsPayload::strength,
-
-                        DetonationEffectsPayload::new
-                );
+                    @Override
+                    public void encode(
+                            RegistryFriendlyByteBuf buffer,
+                            DetonationEffectsPayload value
+                    ) {
+                        BlockPos.STREAM_CODEC.encode(buffer, value.centre());
+                        buffer.writeFloat(value.flashRadius());
+                        buffer.writeFloat(value.soundRadius());
+                        buffer.writeFloat(value.visualScale());
+                        buffer.writeFloat(value.strength());
+                        buffer.writeVarInt(value.cloudExitY());
+                        buffer.writeFloat(value.shockwaveStrength());
+                        buffer.writeBoolean(value.subterranean());
+                    }
+                };
 
         @Override
         public Type<? extends CustomPacketPayload> type() {
@@ -475,7 +507,9 @@ public final class DetonationNetwork {
                                             buffer.readBoolean(),
                                             buffer.readFloat(),
                                             buffer.readVarInt(),
-                                            buffer.readFloat()
+                                            buffer.readFloat(),
+                                            buffer.readVarInt(),
+                                            buffer.readBoolean()
                                     )
                             );
                         }
@@ -519,6 +553,8 @@ public final class DetonationNetwork {
                             buffer.writeFloat(entry.visualScale());
                             buffer.writeVarInt(entry.cloudAgeTicks());
                             buffer.writeFloat(entry.cloudStrength());
+                            buffer.writeVarInt(entry.cloudExitY());
+                            buffer.writeBoolean(entry.subterranean());
                         }
                     }
                 };
@@ -543,7 +579,9 @@ public final class DetonationNetwork {
             boolean cloudActive,
             float visualScale,
             int cloudAgeTicks,
-            float cloudStrength
+            float cloudStrength,
+            int cloudExitY,
+            boolean subterranean
     ) {
     }
 }

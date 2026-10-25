@@ -24,11 +24,10 @@ public final class FalloutSpawnHandler {
             return;
         }
 
-        if (DetonationSavedData.get(level.getServer()).isInsideActiveFallout(
-                level.dimension(),
-                event.getX(),
-                event.getZ()
-        )) {
+        if (UndergroundSpawnSuppression.contains(level.dimension(),
+                    event.getX(), event.getY(), event.getZ())
+                || DetonationSavedData.get(level.getServer()).isInsideActiveFallout(
+                level.dimension(), event.getX(), event.getZ())) {
             event.setResult(MobSpawnEvent.PositionCheck.Result.FAIL);
         }
     }

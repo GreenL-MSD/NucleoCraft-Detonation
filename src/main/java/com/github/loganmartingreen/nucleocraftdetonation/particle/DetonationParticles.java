@@ -63,8 +63,17 @@ public final class DetonationParticles {
             float gravity,
             float drag,
             float endAlpha,
-            boolean fullBright
+            boolean fullBright,
+            float initialAlpha
     ) implements ParticleOptions {
+        /** Existing surface/fallout calls retain the original opaque start. */
+        public TintedPoofOptions(int startRgb, int endRgb, float startScale,
+                                 float endScale, int lifetime, float gravity,
+                                 float drag, float endAlpha, boolean fullBright) {
+            this(startRgb, endRgb, startScale, endScale, lifetime, gravity,
+                    drag, endAlpha, fullBright, 1.0F);
+        }
+
         public static final MapCodec<TintedPoofOptions> CODEC =
                 RecordCodecBuilder.mapCodec(instance -> instance.group(
                         Codec.INT.fieldOf("start_rgb").forGetter(TintedPoofOptions::startRgb),
@@ -75,7 +84,8 @@ public final class DetonationParticles {
                         Codec.FLOAT.fieldOf("gravity").forGetter(TintedPoofOptions::gravity),
                         Codec.FLOAT.fieldOf("drag").forGetter(TintedPoofOptions::drag),
                         Codec.FLOAT.fieldOf("end_alpha").forGetter(TintedPoofOptions::endAlpha),
-                        Codec.BOOL.fieldOf("full_bright").forGetter(TintedPoofOptions::fullBright)
+                        Codec.BOOL.fieldOf("full_bright").forGetter(TintedPoofOptions::fullBright),
+                        Codec.FLOAT.optionalFieldOf("initial_alpha", 1.0F).forGetter(TintedPoofOptions::initialAlpha)
                 ).apply(instance, TintedPoofOptions::new));
 
         public static final StreamCodec<RegistryFriendlyByteBuf, TintedPoofOptions> STREAM_CODEC =
@@ -91,7 +101,8 @@ public final class DetonationParticles {
                                 buffer.readFloat(),
                                 buffer.readFloat(),
                                 buffer.readFloat(),
-                                buffer.readBoolean()
+                                buffer.readBoolean(),
+                                buffer.readFloat()
                         );
                     }
 
@@ -109,6 +120,7 @@ public final class DetonationParticles {
                         buffer.writeFloat(value.drag());
                         buffer.writeFloat(value.endAlpha());
                         buffer.writeBoolean(value.fullBright());
+                        buffer.writeFloat(value.initialAlpha());
                     }
                 };
 
@@ -120,6 +132,7 @@ public final class DetonationParticles {
             lifetime = Math.max(1, lifetime);
             drag = Math.clamp(drag, 0.0F, 1.25F);
             endAlpha = Math.clamp(endAlpha, 0.0F, 1.0F);
+            initialAlpha = Math.clamp(initialAlpha, 0.0F, 1.0F);
         }
 
         @Override

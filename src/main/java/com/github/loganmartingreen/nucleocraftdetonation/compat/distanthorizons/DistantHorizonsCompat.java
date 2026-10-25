@@ -1,10 +1,14 @@
 package com.github.loganmartingreen.nucleocraftdetonation.compat.distanthorizons;
 
-import com.github.loganmartingreen.nucleocraftdetonation.client.DetonationClient;
 import com.github.loganmartingreen.nucleocraftdetonation.config.DetonationTuning;
 import com.github.loganmartingreen.nucleocraftdetonation.network.DetonationNetwork.TerrainChunkLodRefreshCompletePayload;
 import com.github.loganmartingreen.nucleocraftdetonation.particle.DetonationParticleSystem;
+import com.github.loganmartingreen.nucleocraftdetonation.particle.SurfaceMushroomStem;
 import com.github.loganmartingreen.nucleocraftdetonation.particle.DetonationParticleSystem.CloudSnapshot;
+import com.github.loganmartingreen.nucleocraftdetonation.particle.DetonationParticleSystem.UndergroundSnapshot;
+import com.github.loganmartingreen.nucleocraftdetonation.particle.UndergroundVisualTimeline;
+import com.github.loganmartingreen.nucleocraftdetonation.particle.SurfaceCapThermalLayer;
+import com.github.loganmartingreen.nucleocraftdetonation.particle.SurfaceCloudLodProfile;
 import com.mojang.logging.LogUtils;
 
 import net.minecraft.client.Minecraft;
@@ -33,13 +37,15 @@ import java.util.Set;
 /**
  * Optional Distant Horizons integration.
  *
- * <p>Provides three compatibility paths:</p>
+ * <p>Provides two compatibility paths:</p>
  * <ol>
- *     <li>DH far fog follows NucleoCraft fallout intensity and colour.</li>
  *     <li>Completed crater chunks are submitted for LOD regeneration.</li>
  *     <li>A low-detail persistent mushroom cloud is rendered through DH's
  *     generic object renderer outside the normal close-up particle range.</li>
  * </ol>
+ *
+ * <p>NucleoCraft deliberately does not override either vanilla or Distant
+ * Horizons fog settings.</p>
  */
 public final class DistantHorizonsCompat {
     private static final Logger LOGGER = LogUtils.getLogger();
@@ -56,8 +62,6 @@ public final class DistantHorizonsCompat {
             new HashSet<>();
 
     private static ClientLevel previousLevel;
-    private static float lastFogIntensity = -1.0F;
-    private static boolean falloutFogOverrideActive;
     private static int ticks;
 
     private DistantHorizonsCompat() {
@@ -107,8 +111,6 @@ public final class DistantHorizonsCompat {
             clearRendererState();
             API.clearConfigOverrides();
             previousLevel = minecraft.level;
-            lastFogIntensity = -1.0F;
-            falloutFogOverrideActive = false;
         }
 
         ticks++;
@@ -116,7 +118,6 @@ public final class DistantHorizonsCompat {
             return;
         }
 
-        syncFalloutFog();
         processCraterRefreshes(minecraft);
         syncDistantClouds(minecraft);
     }
@@ -196,8 +197,6 @@ public final class DistantHorizonsCompat {
         clearRendererState();
         API.clearConfigOverrides();
         previousLevel = null;
-        lastFogIntensity = -1.0F;
-        falloutFogOverrideActive = false;
     }
 
     public static void clearMushroomClouds() {
@@ -209,27 +208,6 @@ public final class DistantHorizonsCompat {
             API.removeGroup(cloud.retiringGroup);
         }
         DISTANT_CLOUDS.clear();
-    }
-
-    private static void syncFalloutFog() {
-        float intensity = DetonationClient.falloutIntensity();
-        lastFogIntensity = intensity;
-
-        /* DH config writes can trigger renderer/config rebuilds. Apply one
-         * stable fallout override when entering the zone and clear it once on
-         * exit instead of rewriting the values as intensity changes. */
-        if (intensity > 0.02F) {
-            if (!falloutFogOverrideActive) {
-                API.applyFalloutFog(1.0F);
-                falloutFogOverrideActive = true;
-            }
-            return;
-        }
-
-        if (falloutFogOverrideActive) {
-            API.clearFogOverrides();
-            falloutFogOverrideActive = false;
-        }
     }
 
     private static void processCraterRefreshes(Minecraft minecraft) {
@@ -381,6 +359,40 @@ public final class DistantHorizonsCompat {
             API.setGroupActive(distantCloud.registeredGroup, active);
         }
 
+        // Underground jets are a different visual: never register them as a
+        // mushroom cap. Their distant geometry uses the common underground
+        // timeline, just like particle and near-voxel modes.
+        for (UndergroundSnapshot shot : DetonationParticleSystem.snapshotUnderground()) {
+            CloudKey key = new CloudKey(Double.doubleToLongBits(shot.x()),
+                    Double.doubleToLongBits(shot.y()), Double.doubleToLongBits(shot.z()),
+                    Float.floatToIntBits(shot.scale()) ^ 0x5A713E20);
+            present.add(key);
+            DistantCloud distant = DISTANT_CLOUDS.computeIfAbsent(key,
+                    ignored -> new DistantCloud());
+            if (distant.retiringGroup != null) {
+                API.removeGroup(distant.retiringGroup);
+                distant.retiringGroup = null;
+            }
+            int bucket = shot.age() / 5;
+            double near = Math.max(220.0D, shot.scale() * 15.0D);
+            boolean shouldBeActive = minecraft.player.distanceToSqr(
+                    shot.x(), shot.y(), shot.z()) >= near * near;
+            if (distant.registeredGroup == null || distant.ageBucket != bucket) {
+                int replacementSlot = 1 - distant.activeSlot;
+                Object replacement = buildUndergroundGroup(levelWrapper,
+                        minecraft.level, shot, replacementSlot, shouldBeActive);
+                if (replacement != null) {
+                    Object previous = distant.registeredGroup;
+                    distant.registeredGroup = replacement;
+                    distant.activeSlot = replacementSlot;
+                    distant.ageBucket = bucket;
+                    distant.retiringGroup = previous;
+                }
+            }
+            distant.active = distant.registeredGroup != null && shouldBeActive;
+            API.setGroupActive(distant.registeredGroup, distant.active);
+        }
+
         Iterator<Map.Entry<CloudKey, DistantCloud>> iterator =
                 DISTANT_CLOUDS.entrySet().iterator();
         while (iterator.hasNext()) {
@@ -401,6 +413,102 @@ public final class DistantHorizonsCompat {
         }
     }
 
+    /** DH representation of a confined fireball or cap-less breakout column. */
+    private static Object buildUndergroundGroup(Object wrapper, ClientLevel level,
+            UndergroundSnapshot shot, int slot, boolean active) {
+        if (wrapper == null || level == null) return null;
+        List<Object> boxes = new ArrayList<>(500);
+        try {
+            double fireRadius = UndergroundVisualTimeline.fireballRadius(
+                    shot.scale(), shot.age(), !shot.breakout());
+            if (fireRadius > 0.5D) {
+                for (int layer = -5; layer <= 5; layer++) {
+                    double v = layer / 5.0D;
+                    double y = shot.y() + fireRadius * v
+                            * UndergroundVisualTimeline.fireballVerticalRatio(!shot.breakout());
+                    double radius = fireRadius * Math.sqrt(Math.max(0.0D, 1.0D - v*v));
+                    int rgb = UndergroundVisualTimeline.mix(0xFF8A2A, 0x414743,
+                            UndergroundVisualTimeline.smooth((shot.age() - 42.0D) / 80.0D));
+                    addUndergroundDisc(boxes, level, shot, y, radius,
+                            Math.max(2.0D, radius * 0.42D), rgb, 245, layer * 19);
+                }
+            }
+            if (shot.breakout() && shot.age() >= UndergroundVisualTimeline.JET_START_TICK) {
+                double top = UndergroundVisualTimeline.jetTop(shot.y(), shot.exitY(),
+                        shot.scale(), shot.age());
+                double length = top - shot.y();
+                int layers = Math.clamp((int)(length / Math.max(2.0D, shot.scale() * 0.17D)),
+                        10, 35);
+                for (int layer = 0; layer <= layers; layer++) {
+                    double h = layer / (double) layers;
+                    double y = shot.y() + h * length;
+                    double radius = UndergroundVisualTimeline.jetRadius(shot.y(),
+                            shot.exitY(), y, shot.scale());
+                    double cooling = UndergroundVisualTimeline.cooling(shot.age(), y,
+                            shot.y(), top);
+                    int rgb = UndergroundVisualTimeline.jetColour(shot.age(), h, cooling);
+                    int alpha = (int)(255.0D * UndergroundVisualTimeline.jetAlpha(
+                            shot.age(), h, 0.5D));
+                    addUndergroundDisc(boxes, level, shot, y, radius,
+                            Math.max(2.0D, radius * 0.44D), rgb, alpha, layer * 29,
+                            shot.age(), h);
+                    if (layer % 3 == 0 && y >= shot.exitY()) {
+                        addUndergroundFringe(boxes, level, shot, y, radius,
+                                Math.max(1.7D, radius * 0.37D),
+                                Math.max(2.0D, length / layers), h, top, layer);
+                    }
+                }
+            }
+            long hash = Double.doubleToLongBits(shot.x());
+            hash = 31 * hash + Double.doubleToLongBits(shot.y());
+            hash = 31 * hash + Double.doubleToLongBits(shot.z());
+            String id = "nucleocraft_detonation:underground_plume_"
+                    + Long.toUnsignedString(hash, 36) + (slot == 0 ? "_a" : "_b");
+            return API.createAndRegisterGroup(wrapper, id, shot.x(), shot.y(), shot.z(),
+                    boxes, shot.age() < UndergroundVisualTimeline.JET_COOL_START_TICK,
+                    active);
+        } catch (ReflectiveOperationException error) {
+            LOGGER.warn("Unable to register underground DH visual", error);
+            return null;
+        }
+    }
+
+    private static void addUndergroundDisc(List<Object> boxes, ClientLevel level,
+            UndergroundSnapshot shot, double y, double radius, double cell,
+            int rgb, int alpha, int seed) throws ReflectiveOperationException {
+        addUndergroundDisc(boxes, level, shot, y, radius, cell, rgb, alpha,
+                seed, -1, 0.0D);
+    }
+
+    private static void addUndergroundDisc(List<Object> boxes, ClientLevel level,
+            UndergroundSnapshot shot, double y, double radius, double cell,
+            int rgb, int alpha, int seed, int jetAge, double heightProgress)
+            throws ReflectiveOperationException {
+        if (radius < 0.5D || alpha <= 0) return;
+        double spacing = Math.max(1.0D, cell * 0.76D);
+        int extent = Math.min(10, (int)Math.ceil(radius / spacing));
+        for (int gx = -extent; gx <= extent; gx++) {
+            for (int gz = -extent; gz <= extent; gz++) {
+                double dx = gx * spacing, dz = gz * spacing;
+                if (dx * dx + dz * dz > Math.pow(radius + cell * 0.28D, 2)) continue;
+                int blockX = Mth.floor(shot.x() + dx), blockZ = Mth.floor(shot.z() + dz);
+                if (!level.hasChunk(blockX >> 4, blockZ >> 4)
+                        || !level.getBlockState(BlockPos.containing(shot.x() + dx, y,
+                                shot.z() + dz)).isAir()) continue;
+                double radial = Math.hypot(dx, dz) / Math.max(1.0D, radius);
+                int pixelAlpha = jetAge < 0 ? alpha
+                        : (int)Math.round(255.0D * UndergroundVisualTimeline.jetAlpha(
+                                jetAge, heightProgress, radial));
+                if (pixelAlpha < 6) continue;
+                Color c = new Color((rgb >>> 16) & 255, (rgb >>> 8) & 255,
+                        rgb & 255, Math.clamp(pixelAlpha, 0, 255));
+                addBoxCentred(boxes, dx, y - shot.y(), dz,
+                        cell, cell * 1.35D, organicShade(c, seed, gx, gz),
+                        shot.age() < UndergroundVisualTimeline.JET_COOL_START_TICK);
+            }
+        }
+    }
+
     private static Object buildCloudGroup(
             Object levelWrapper,
             ClientLevel level,
@@ -417,8 +525,9 @@ public final class DistantHorizonsCompat {
                 < (int) (DetonationTuning.ParticleCloud.FIREBALL_COLOUR_TRANSITION_TICKS * 0.46D);
 
         try {
+            // Legacy v42.5.6 stem mesh; newer single-layer cap LOD remains.
             addStemBoxes(boxes, cloud);
-            addCapBoxes(boxes, cloud);
+            addCapComponentBoxes(boxes, cloud);
             addCapUndersideRing(boxes, cloud);
             addCraterRing(boxes, level, cloud);
 
@@ -445,113 +554,127 @@ public final class DistantHorizonsCompat {
         }
     }
 
-    private static void addStemBoxes(
-            List<Object> boxes,
-            CloudSnapshot cloud
-    ) throws ReflectiveOperationException {
-        if (cloud.stemHeight() <= 1.0D) {
-            return;
-        }
-
-        double matureRadius = DetonationParticleSystem.getMatureCloudRadius(
-                cloud.visualScale()
-        );
-        int layers = DetonationTuning.DistantHorizons.STEM_LAYERS;
-
-        for (int layer = 0; layer < layers; layer++) {
-            double heightProgress = layer / (double) (layers - 1);
-            double verticalTaper = 1.05D
-                    - 0.47D * smoothstep(heightProgress);
-            double bulge = 0.96D
-                    + 0.10D * Math.sin(heightProgress * Math.PI);
-            double middleCurve = 1.0D
-                    - DetonationTuning.ParticleCloud.STEM_MIDDLE_CURVE_STRENGTH
-                    * Math.pow(
-                    Math.sin(heightProgress * Math.PI),
-                    DetonationTuning.ParticleCloud.STEM_MIDDLE_CURVE_POWER
-            );
-            double localRadius = matureRadius
-                    * DetonationTuning.ParticleCloud.STEM_RADIUS_RATIO
-                    * verticalTaper
-                    * bulge
-                    * middleCurve;
-            double y = cloud.stemBaseY()
-                    + cloud.stemHeight() * heightProgress;
-            double boxSize = Math.max(
-                    1.75D,
-                    localRadius
-                            * 0.30D
-            );
-            double layerSpacing = cloud.stemHeight()
-                    / Math.max(1.0D, layers - 1.0D);
-            double boxHeight = Math.max(
-                    boxSize * 1.20D,
-                    layerSpacing * 1.16D
-            );
-            Color colour = cloudColour(cloud.visualScale(), cloud.ageTicks(), -12);
-
-            addFilledDiscBoxes(
-                    boxes,
-                    0.0D,
-                    y - cloud.centreY(),
-                    0.0D,
-                    localRadius,
-                    boxSize,
-                    boxHeight,
-                    colour,
-                    false,
-                    layer * 17
-            );
+    private static void addUndergroundFringe(List<Object> boxes, ClientLevel level,
+            UndergroundSnapshot shot, double y, double radius, double cell,
+            double sliceHeight, double h, double top, int layer)
+            throws ReflectiveOperationException {
+        boolean head = h > 0.78D;
+        int alpha = (int)Math.round(255.0D * UndergroundVisualTimeline.fringeAlpha(
+                shot.age(), h, head));
+        if (alpha < 6) return;
+        double breakup = UndergroundVisualTimeline.breakup(shot.age(), h);
+        double cool = UndergroundVisualTimeline.cooling(shot.age(), y, shot.y(), top);
+        int hot = UndergroundVisualTimeline.jetColour(shot.age(), h, cool);
+        int rgb = UndergroundVisualTimeline.mix(hot, 0x747874, 0.32D + cool * 0.54D);
+        int parts = head ? 16 : 10;
+        for (int i = 0; i < parts; i++) {
+            double angle = i * Math.PI * 2.0D / parts + layer * 0.37D;
+            double irregular = (Math.sin(i * 12.73D + layer * 7.1D) + 1.0D) * 0.5D;
+            double distance = radius * (1.05D + irregular * (0.27D + breakup * 0.65D));
+            double dx = Math.cos(angle) * distance;
+            double dz = Math.sin(angle) * distance;
+            double fy = y + (irregular - 0.5D) * Math.max(cell, sliceHeight);
+            if (!level.hasChunk(Mth.floor(shot.x() + dx) >> 4,
+                    Mth.floor(shot.z() + dz) >> 4) ||
+                    !level.getBlockState(BlockPos.containing(
+                            shot.x() + dx, fy, shot.z() + dz)).isAir()) continue;
+            Color color = new Color((rgb >> 16) & 255, (rgb >> 8) & 255,
+                    rgb & 255, Math.clamp(alpha, 0, 255));
+            addBoxCentred(boxes, dx, fy - shot.y(), dz, cell,
+                    Math.max(cell, sliceHeight * 1.55D),
+                    organicShade(color, layer, i, parts), false);
         }
     }
 
-    private static void addCapBoxes(
-            List<Object> boxes,
-            CloudSnapshot cloud
-    ) throws ReflectiveOperationException {
-        int layers = Math.max(DetonationTuning.DistantHorizons.CAP_LAYERS + 2, 6);
-        Color baseColour = cloudColour(cloud.visualScale(), cloud.ageTicks(), 0);
+    /** DH-specific representation: one solid, dark charcoal smoke column.
+     *
+     * At LOD resolution the near renderer's separate translucent smoke skin and
+     * inner voxels become washed out and can leave visible gaps. Distant cubes
+     * therefore fill the full v42.7 stem contour with no stacked translucent
+     * voxels. The near VOXEL/PARTICLE stem and cap are not affected.
+     */
+    private static void addStemBoxes(List<Object> boxes, CloudSnapshot cloud)
+            throws ReflectiveOperationException {
+        SurfaceMushroomStem.Frame frame = SurfaceMushroomStem.frame(
+                cloud.centreY(), cloud.capCentreY(), cloud.capVerticalRadius(),
+                cloud.visualScale(), cloud.ageTicks());
+        if (!frame.visible()) return;
+        int slices = Math.max(14, Math.min(34, SurfaceMushroomStem.slices(frame)));
+        double verticalStep = frame.height() / Math.max(1.0D, slices - 1.0D);
+        int alpha = DetonationParticleSystem.getCloudVoxelAlpha(frame.age());
+        if (alpha <= 5) return;
+        for (int layer = 0; layer < slices; layer++) {
+            double h = layer / (double) (slices - 1);
+            double radius = SurfaceMushroomStem.radius(frame, h);
+            double cell = Math.max(2.0D, SurfaceMushroomStem.voxelSize(radius) * 1.30D);
+            double boxHeight = Math.max(cell * 1.16D, verticalStep * 1.20D);
+            double y = frame.bottomY() + frame.height() * h - cloud.centreY();
+            double spacing = Math.max(1.4D, cell * 0.92D);
+            int extent = Math.max(0, (int) Math.ceil(radius / spacing));
+            // Keep the stem as dark as the cap's smoke, even though its
+            // close-range inner body is lighter and briefly warm at the base.
+            int rgb = DetonationParticleSystem.adjustRgb(
+                    SurfaceMushroomStem.shellColour(frame.scale(), frame.age(), h), -12);
+            for (int gx = -extent; gx <= extent; gx++) {
+                for (int gz = -extent; gz <= extent; gz++) {
+                    double x = gx * spacing, z = gz * spacing;
+                    if (x * x + z * z > radius * radius) continue;
+                    Color colour = new Color((rgb >>> 16) & 255,
+                            (rgb >>> 8) & 255, rgb & 255, alpha);
+                    addBoxCentred(boxes, x, y, z, cell, boxHeight,
+                            organicShade(colour, layer * 17, gx, gz), false);
+                }
+            }
+        }
+    }
+
+    private static void addCapComponentBoxes(List<Object> boxes,
+            CloudSnapshot cloud) throws ReflectiveOperationException {
+        int layers = Math.max(DetonationTuning.DistantHorizons.CAP_LAYERS + 5, 12);
         double verticalSpan = cloud.capVerticalRadius() * 1.84D;
         double layerSpacing = verticalSpan / Math.max(1.0D, layers - 1.0D);
-
         for (int layer = 0; layer < layers; layer++) {
-            double verticalNormal = layers == 1
-                    ? 0.0D
-                    : (layer / (double) (layers - 1)) * 2.0D - 1.0D;
-            double layerY = cloud.capCentreY()
-                    + verticalNormal * cloud.capVerticalRadius() * 0.92D;
-            double radiusFactor = Math.sqrt(
-                    Math.max(
-                            0.16D,
-                            1.0D - verticalNormal * verticalNormal * 0.76D
-                    )
-            );
-            double layerRadius = cloud.capRadius() * (radiusFactor + 0.04D);
-            double boxSize = Math.max(
-                    4.0D,
-                    layerRadius
-                            * DetonationTuning.DistantHorizons.CAP_BOX_RADIUS_RATIO
-            );
-            double boxHeight = Math.max(
-                    4.0D,
-                    Math.max(
-                            cloud.capVerticalRadius() * 0.34D,
-                            layerSpacing * 1.14D
-                    )
-            );
+            double v = layers == 1 ? 0.0D
+                    : layer / (double) (layers - 1) * 2.0D - 1.0D;
+            double y = cloud.capCentreY() + v * cloud.capVerticalRadius() * 0.92D;
+            double factor = Math.sqrt(Math.max(0.16D, 1.0D - v * v * 0.76D));
+            double radius = cloud.capRadius() * (factor + 0.04D);
+            double box = Math.max(4.0D,
+                    radius * DetonationTuning.DistantHorizons.CAP_BOX_RADIUS_RATIO);
+            double height = Math.max(4.0D,
+                    Math.max(cloud.capVerticalRadius() * 0.34D, layerSpacing * 1.14D));
+            addCapComponentDisc(boxes, 0.0D, y - cloud.centreY(), 0.0D,
+                    radius, box, height, cloud.visualScale(), cloud.ageTicks(),
+                    layer * 31, v);
+        }
+    }
 
-            addFilledDiscBoxes(
-                    boxes,
-                    0.0D,
-                    layerY - cloud.centreY(),
-                    0.0D,
-                    layerRadius,
-                    boxSize,
-                    boxHeight,
-                    baseColour,
-                    cloud.ageTicks() < (int) (DetonationTuning.ParticleCloud.FIREBALL_COLOUR_TRANSITION_TICKS * 0.46D),
-                    layer * 31
-            );
+    private static void addCapComponentDisc(List<Object> boxes,
+            double cx, double y, double cz, double radius, double box,
+            double height, float scale, int age, int seed, double v)
+            throws ReflectiveOperationException {
+        double spacing = Math.max(1.0D, box * Math.min(0.72D,
+                DetonationTuning.DistantHorizons.BOX_SPACING_RATIO));
+        int extent = Math.max(0, (int) Math.ceil(radius / spacing));
+        double accepted = radius + box * 0.36D;
+        int fade = DetonationParticleSystem.getCloudVoxelAlpha(age);
+        if (fade < 6) return;
+        int smokeRgb = DetonationParticleSystem.getCapShellColour(scale, age, 0.99D);
+        for (int gx = -extent; gx <= extent; gx++) {
+            for (int gz = -extent; gz <= extent; gz++) {
+                double px = gx * spacing, pz = gz * spacing;
+                double distance = Math.hypot(px, pz);
+                if (distance > accepted) continue;
+                double radial = distance / Math.max(1.0D, radius);
+                int heated = SurfaceCapThermalLayer.thermalRgb(age, radial, v);
+                int rgb = SurfaceCloudLodProfile.capColour(smokeRgb, heated,
+                        age, radial, v, seed, gx, gz);
+                int alpha = fade;
+                Color colour = new Color((rgb >>> 16) & 255,
+                        (rgb >>> 8) & 255, rgb & 255, alpha);
+                addBoxCentred(boxes, cx + px, y, cz + pz, box, height,
+                        organicShade(colour, seed, gx, gz), false);
+            }
         }
     }
 
@@ -562,6 +685,9 @@ public final class DistantHorizonsCompat {
         if (!cloud.atMaximumHeight()) {
             return;
         }
+        double visibility = DetonationParticleSystem.getCapUndersideRingVisibility(
+                cloud.visualScale(), cloud.ageTicks());
+        if (visibility <= 0.0D) return;
 
         double ringRadius = cloud.capRadius()
                 * DetonationTuning.ParticleCloud.CAP_UNDERSIDE_RING_RADIUS_RATIO;
@@ -578,8 +704,8 @@ public final class DistantHorizonsCompat {
         for (int segment = 0; segment < segments; segment++) {
             double angle = segment / (double) segments * Math.PI * 2.0D;
             Color colour = segment % 4 == 0
-                    ? new Color(75, 74, 70, 230)
-                    : new Color(41, 44, 43, 235);
+                    ? new Color(75, 74, 70, (int) Math.round(230 * visibility))
+                    : new Color(41, 44, 43, (int) Math.round(235 * visibility));
             addBoxCentred(
                     boxes,
                     Math.cos(angle) * ringRadius,
@@ -689,6 +815,14 @@ public final class DistantHorizonsCompat {
                 );
             }
         }
+    }
+
+    private static Color stemRingColour(float scale, int age, double height, int shade) {
+        int rgb = DetonationParticleSystem.getStemBandColour(scale, age, height,
+                DetonationParticleSystem.getStemLayerColour(scale, age, height, shade));
+        int alpha = (int) Math.round(255.0D *
+                (1.0D - DetonationParticleSystem.getStemDissipation(age)));
+        return new Color((rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255, alpha);
     }
 
     private static int getOverlappingRingSegments(

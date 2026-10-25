@@ -11,8 +11,8 @@ import java.util.regex.Pattern;
  * 1 Minecraft TNT block is treated as exactly 1 tonne of TNT equivalent.
  */
 public record NuclearYield(double kilotonnes) {
-    public static final double MIN_KILOTONNES = 10.0D;
-    public static final double MAX_KILOTONNES = 25_000.0D;
+    public static final double MIN_KILOTONNES = 1.0D;
+    public static final double MAX_KILOTONNES = 20_000.0D;
 
     private static final Pattern INPUT_PATTERN = Pattern.compile(
         "^([0-9]+(?:\\.[0-9]+)?)(t|kt|mt)$",
@@ -24,7 +24,7 @@ public record NuclearYield(double kilotonnes) {
             throw new IllegalArgumentException("Yield must be a finite number.");
         }
         if (kilotonnes < MIN_KILOTONNES || kilotonnes > MAX_KILOTONNES) {
-            throw new IllegalArgumentException("Yield must be between 10kt and 25mt.");
+            throw new IllegalArgumentException("Yield must be between 1kt and 20mt.");
         }
     }
 
@@ -34,7 +34,7 @@ public record NuclearYield(double kilotonnes) {
 
         if (!matcher.matches()) {
             throw new IllegalArgumentException(
-                "Invalid yield. Examples: 10kt, 37.5kt, 1mt, 2.3mt."
+                "Invalid yield. Examples: 1kt, 10kt, 37.5kt, 1mt, 20mt."
             );
         }
 

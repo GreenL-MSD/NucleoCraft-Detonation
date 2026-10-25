@@ -4,6 +4,9 @@ import com.github.loganmartingreen.nucleocraftdetonation.NucleoCraftDetonation;
 import com.github.loganmartingreen.nucleocraftdetonation.fluid.DetonationFluids;
 
 import net.minecraft.world.item.BlockItem;
+import net.minecraft.world.item.BucketItem;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.Items;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.RotatedPillarBlock;
@@ -11,6 +14,7 @@ import net.minecraft.world.level.block.LiquidBlock;
 import net.minecraft.world.level.block.SlabBlock;
 import net.minecraft.world.level.block.StairBlock;
 import net.minecraft.world.level.block.state.BlockBehaviour;
+import net.minecraft.world.level.material.MapColor;
 
 import net.neoforged.bus.api.IEventBus;
 import net.neoforged.neoforge.registries.DeferredBlock;
@@ -100,6 +104,7 @@ public final class DetonationBlocks {
                             properties
                     ),
                     BlockBehaviour.Properties.ofFullCopy(Blocks.WATER)
+                            .mapColor(MapColor.COLOR_GREEN)
             );
 
     public static final DeferredBlock<RotatedPillarBlock> CHARRED_LOG =
@@ -140,6 +145,18 @@ public final class DetonationBlocks {
             ITEMS.registerSimpleBlockItem(CHARRED_LOG);
     public static final DeferredItem<BlockItem> RAD_LEAVES_ITEM =
             ITEMS.registerSimpleBlockItem(RAD_LEAVES);
+
+    /** Placeable creative/survival container for the custom irradiated fluid. */
+    public static final DeferredItem<BucketItem> IRRADIATED_WATER_BUCKET =
+            ITEMS.register(
+                    "irradiated_water_bucket",
+                    () -> new BucketItem(
+                            DetonationFluids.IRRADIATED_WATER.get(),
+                            new Item.Properties()
+                                    .craftRemainder(Items.BUCKET)
+                                    .stacksTo(1)
+                    )
+            );
 
     private DetonationBlocks() {
     }

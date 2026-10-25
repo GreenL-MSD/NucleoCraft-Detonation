@@ -53,6 +53,7 @@ public final class DetonationFluids {
                 FLOWING_IRRADIATED_WATER
         )
                 .block(() -> DetonationBlocks.IRRADIATED_WATER.get())
+                .bucket(() -> DetonationBlocks.IRRADIATED_WATER_BUCKET.get())
                 .slopeFindDistance(4)
                 .levelDecreasePerBlock(1)
                 .tickRate(5)

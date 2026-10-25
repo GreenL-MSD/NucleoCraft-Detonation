@@ -48,14 +48,46 @@ public final class DetonationParticleSystem {
     private static final int DEEP_ORANGE = 0xB8461F;
     private static final int BURNT_BROWN = 0x684035;
     private static final int WARM_GREY = 0x4B4A46;
-    private static final int DARK_GREY = 0x292C2B;
-    private static final int MATURE_SMOKE_GREY = 0x242826;
-    private static final int LIGHT_MATURE_SMOKE_GREY = 0x555B58;
+    private static final int DARK_GREY = 0x383D3A;
+    private static final int MATURE_SMOKE_GREY = 0x414541;
+    private static final int LIGHT_MATURE_SMOKE_GREY = 0x686D69;
     private static final int NEAR_BLACK = 0x111312;
 
     private static final List<ActiveCloud> ACTIVE_CLOUDS =
             new ArrayList<>();
     private static int particleClearGeneration;
+    private static final List<UndergroundEffect> UNDERGROUND_EFFECTS = new ArrayList<>();
+    private static boolean debugMode;
+
+    public static void setDebugMode(boolean enabled) { debugMode = enabled; }
+
+    public static void startSealed(double x, double y, double z, float scale, float strength) {
+        startUnderground(x, y, z, Double.NaN, scale, strength, 0);
+    }
+
+    private static void startUnderground(double x, double y, double z,
+                                        double exitY, float scale, float strength, int age) {
+        UNDERGROUND_EFFECTS.removeIf(effect ->
+                Math.abs(effect.x - x) < 0.001D && Math.abs(effect.y - y) < 0.001D
+                        && Math.abs(effect.z - z) < 0.001D);
+        UNDERGROUND_EFFECTS.add(new UndergroundEffect(x, y, z, exitY,
+                Math.max(1.0F, scale), Math.clamp(strength, 0.0F, 1.0F),
+                Math.max(0, age)));
+        if (Double.isFinite(exitY)) {
+            debugVisual("Underground fireball ignition; separate breakout jet (no mushroom cap)");
+        } else {
+            debugVisual("Underground fireball ignition; contained; no surface jet or shockwave");
+        }
+    }
+
+    private static void debugVisual(String stage) {
+        Minecraft client = Minecraft.getInstance();
+        if (debugMode && client.player != null) {
+            client.player.displayClientMessage(
+                    net.minecraft.network.chat.Component.literal("[NUKE VISUAL] " + stage), false);
+        }
+    }
+
 
     private DetonationParticleSystem() {
     }
@@ -111,6 +143,7 @@ public final class DetonationParticleSystem {
                         centreZ,
                         safeScale,
                         Math.clamp(strength, 0.0F, 1.0F),
+                        Double.NaN,
                         Math.clamp(
                                 ageTicks,
                                 0,
@@ -118,6 +151,14 @@ public final class DetonationParticleSystem {
                         )
                 )
         );
+    }
+
+    /** Breakout effects never join the surface mushroom-cloud list. */
+    public static void startBreakout(double centreX, double centreY, double centreZ,
+                                    double breakoutSurfaceY, float visualScale,
+                                    float strength, int ageTicks) {
+        startUnderground(centreX, centreY, centreZ, breakoutSurfaceY,
+                visualScale, strength, ageTicks);
     }
 
     public static void tick(
@@ -132,17 +173,36 @@ public final class DetonationParticleSystem {
         }
 
         ClientLevel level = minecraft.level;
+        Iterator<UndergroundEffect> underground = UNDERGROUND_EFFECTS.iterator();
+        boolean particleMode = DetonationClientConfig.mushroomCloudRenderer()
+                == DetonationClientConfig.MushroomCloudRenderer.PARTICLES;
+        while (underground.hasNext()) {
+            UndergroundEffect effect = underground.next();
+            double view = getViewDistance(effect.scale);
+            if (particleMode && minecraft.player.distanceToSqr(effect.x, effect.y, effect.z)
+                    < view * view) {
+                spawnUndergroundParticles(level, effect);
+            }
+            if (++effect.age >= UndergroundVisualTimeline.lifetime(effect.isBreakout())) {
+                debugVisual(effect.isBreakout() ? "Breakout plume dissipated" :
+                        "Underground fireball cooled and dissipated");
+                underground.remove();
+            }
+        }
         Iterator<ActiveCloud> iterator = ACTIVE_CLOUDS.iterator();
 
         while (iterator.hasNext()) {
             ActiveCloud cloud = iterator.next();
 
             double viewDistance = getViewDistance(cloud.visualScale);
-            double distanceSquared = minecraft.player.distanceToSqr(
-                    cloud.centreX,
-                    cloud.centreY + getStemHeight(cloud.visualScale) * 0.55D,
-                    cloud.centreZ
-            );
+            SurfaceMushroomStem.Frame stemFrame = SurfaceMushroomStem.frame(
+                    cloud.centreY, getCloudHeadCentreY(cloud),
+                    getCloudVerticalRadius(cloud), cloud.visualScale, cloud.ageTicks);
+            double distanceSquared = SurfaceMushroomStem.distanceSquaredToCloud(
+                    minecraft.player.getX(), minecraft.player.getY(),
+                    minecraft.player.getZ(), cloud.centreX, cloud.centreZ,
+                    stemFrame, getCloudHeadCentreY(cloud)
+                            + getCloudVerticalRadius(cloud));
 
             boolean distantLodActive = DistantHorizonsCompat.isDistantCloudActive(
                     cloud.centreX,
@@ -165,6 +225,13 @@ public final class DetonationParticleSystem {
                 spawnCloudTick(level, cloud);
             }
 
+            if (debugMode) {
+                String stage = visualStage(cloud);
+                if (!stage.equals(cloud.lastStage)) {
+                    cloud.lastStage = stage;
+                    debugVisual(stage);
+                }
+            }
             cloud.ageTicks++;
 
             if (
@@ -176,6 +243,139 @@ public final class DetonationParticleSystem {
         }
     }
 
+    private static String visualStage(ActiveCloud cloud) {
+        if (isBreakoutTravelling(cloud)) return "Breakout plasma jet ascending from underground origin";
+        int age = getFormationAge(cloud);
+        if (isBreakoutCloud(cloud) && age < 20)
+            return "Plasma emerged; cap bloom initiating";
+        if (age < DetonationTuning.ParticleCloud.STEM_START_TICKS)
+            return "Initial hot fireball forming";
+        if (age < getAscentDuration(cloud.visualScale))
+            return "Charcoal stem forming; hot thermal bands rising with cap";
+        if (age < fullSizeTick(cloud.visualScale))
+            return "Mushroom spreading; thermal bands frozen and cooling";
+        if (getStemDissipation(cloud.ageTicks) > 0.0D)
+            return getCapDissipation(cloud.ageTicks) > 0.0D
+                    ? "Cap dissipating outside inward" : "Stem dissipating bottom upward";
+        if (cloud.ageTicks >= fullSizeTick(cloud.visualScale)
+                + DetonationTuning.ParticleCloud.MATURE_GREY_LIGHTEN_DURATION_TICKS)
+            return "Mature medium-grey cloud; thermal bands static and cooling";
+        return "Mushroom at full size; thermal bands remain static";
+    }
+
+    private static void spawnUndergroundParticles(ClientLevel level, UndergroundEffect effect) {
+        final int age = effect.age;
+        double radius = UndergroundVisualTimeline.fireballRadius(
+                effect.scale, age, !effect.isBreakout());
+        if (radius > 0.5D) {
+            double cooled = UndergroundVisualTimeline.smooth((age - 42.0D) / 80.0D);
+            for (int i = 0, count = age < 60 ? 90 : 28; i < count; i++) {
+                double theta = level.random.nextDouble() * Mth.TWO_PI;
+                double vertical = level.random.nextDouble() * 2.0D - 1.0D;
+                double rho = Math.cbrt(level.random.nextDouble());
+                double horizontal = Math.sqrt(1.0D - vertical * vertical) * rho;
+                double x = effect.x + Math.cos(theta) * radius * horizontal;
+                double y = effect.y + vertical * radius * rho
+                        * UndergroundVisualTimeline.fireballVerticalRatio(!effect.isBreakout());
+                double z = effect.z + Math.sin(theta) * radius * horizontal;
+                if (!level.getBlockState(net.minecraft.core.BlockPos.containing(x,y,z)).isAir()) continue;
+                int hot = UndergroundVisualTimeline.mix(HOT_YELLOW, BRIGHT_ORANGE, age / 62.0D);
+                int smoke = UndergroundVisualTimeline.mix(hot, DARK_GREY, cooled);
+                float size = (float) Math.clamp(radius * (0.10D + level.random.nextDouble() * 0.10D),
+                        1.1D, 10.0D);
+                level.addParticle(new TintedPoofOptions(hot, smoke, size, size * 1.2F,
+                        15 + level.random.nextInt(22), 0.0F, 0.93F, 0.02F, age < 45),
+                        x, y, z, 0.0D, 0.0D, 0.0D);
+            }
+        }
+        if (!effect.isBreakout() || age < UndergroundVisualTimeline.JET_START_TICK) return;
+        double top = UndergroundVisualTimeline.jetTop(effect.y, effect.exitY, effect.scale, age);
+        if (top <= effect.y + 0.5D) return;
+        double length = top - effect.y;
+        int count = Math.clamp((int)(length * 2.0D), 90, 290);
+        for (int i = 0; i < count; i++) {
+            double h = level.random.nextDouble();
+            double y = effect.y + length * h;
+            double radiusAtY = UndergroundVisualTimeline.jetRadius(
+                    effect.y, effect.exitY, y, effect.scale);
+            double angle = level.random.nextDouble() * Mth.TWO_PI;
+            double radial = Math.sqrt(level.random.nextDouble());
+            // Keep the jet centred above the opening; turbulence belongs on
+            // the edges, never as a swaying centreline.
+            double x = effect.x + Math.cos(angle) * radial * radiusAtY;
+            double z = effect.z + Math.sin(angle) * radial * radiusAtY;
+            if (!level.getBlockState(net.minecraft.core.BlockPos.containing(x,y,z)).isAir()) continue;
+            double cooling = UndergroundVisualTimeline.cooling(age, y, effect.y, top);
+            double alpha = UndergroundVisualTimeline.jetAlpha(age, h, radial);
+            if (alpha < 0.09D || level.random.nextDouble() > alpha) continue;
+            int colour = UndergroundVisualTimeline.jetColour(age, h, cooling);
+            int next = UndergroundVisualTimeline.mix(colour, 0x747874, cooling * 0.25D);
+            float size = (float) Math.clamp(radiusAtY * (0.30D + level.random.nextDouble() * 0.22D),
+                    1.3D, 12.0D);
+            level.addParticle(new TintedPoofOptions(colour, next, size, size * 1.2F,
+                    12 + level.random.nextInt(20), 0.0F, 0.90F, 0.01F,
+                    cooling < 0.3D, (float) alpha), x, y, z,
+                    0.0D, 0.07D + level.random.nextDouble() * 0.045D, 0.0D);
+        }
+
+        // A sparse, translucent sheath and torn wisps above the outlet soften
+        // the column without ever forming a flat mushroom cap. Side wisps
+        // disperse in different directions rather than moving the centreline.
+        int wisps = Math.clamp((int)(effect.scale * 0.95D), 14, 48);
+        for (int i = 0; i < wisps; i++) {
+            double h = 0.28D + 0.72D * level.random.nextDouble();
+            double y = effect.y + length * h;
+            double breakup = UndergroundVisualTimeline.breakup(age, h);
+            double angle = level.random.nextDouble() * Mth.TWO_PI;
+            double r = UndergroundVisualTimeline.jetRadius(effect.y, effect.exitY, y, effect.scale);
+            boolean head = h > 0.77D;
+            double dist = r * (1.02D + level.random.nextDouble() * (0.30D + 0.62D * breakup));
+            double x = effect.x + Math.cos(angle) * dist;
+            double z = effect.z + Math.sin(angle) * dist;
+            if (!level.getBlockState(net.minecraft.core.BlockPos.containing(x, y, z)).isAir()) continue;
+            double alpha = UndergroundVisualTimeline.fringeAlpha(age, h, head);
+            if (alpha <= 0.05D || level.random.nextDouble() > 0.75D) continue;
+            double cool = UndergroundVisualTimeline.cooling(age, y, effect.y, top);
+            int hot = UndergroundVisualTimeline.jetColour(age, h, cool);
+            int c = UndergroundVisualTimeline.mix(hot, 0x797C78, 0.35D + 0.55D * cool);
+            float size = (float) Math.clamp(r * (0.22D + level.random.nextDouble() * 0.25D),
+                    1.2D, 10.0D);
+            double outward = head ? 0.035D : 0.013D;
+            level.addParticle(new TintedPoofOptions(c, 0x737875, size, size * 1.6F,
+                    17 + level.random.nextInt(24), 0.0F, 0.93F, 0.01F, false,
+                    (float) alpha), x, y, z,
+                    Math.cos(angle) * outward, 0.055D + level.random.nextDouble() * 0.045D,
+                    Math.sin(angle) * outward);
+        }
+    }
+
+    /** Shared snapshots for the voxel renderer and future DH underground LOD path. */
+    public static List<UndergroundSnapshot> snapshotUnderground() {
+        List<UndergroundSnapshot> snapshots = new ArrayList<>(UNDERGROUND_EFFECTS.size());
+        for (UndergroundEffect e : UNDERGROUND_EFFECTS) {
+            snapshots.add(new UndergroundSnapshot(e.x, e.y, e.z, e.exitY,
+                    e.scale, e.strength, e.age));
+        }
+        return List.copyOf(snapshots);
+    }
+
+    public record UndergroundSnapshot(double x, double y, double z, double exitY,
+                                      float scale, float strength, int age) {
+        public boolean breakout() { return Double.isFinite(exitY); }
+    }
+
+    private static final class UndergroundEffect {
+        final double x, y, z, exitY;
+        final float scale, strength;
+        int age;
+        UndergroundEffect(double x, double y, double z, double exitY,
+                          float scale, float strength, int age) {
+            this.x=x; this.y=y; this.z=z; this.exitY=exitY;
+            this.scale=scale; this.strength=strength; this.age=age;
+        }
+        boolean isBreakout() { return Double.isFinite(exitY); }
+    }
+
     private static boolean hasCloudLineOfSight(
             Minecraft minecraft,
             ActiveCloud cloud
@@ -184,19 +384,9 @@ public final class DetonationParticleSystem {
             return false;
         }
 
-        double capCentreY = getFireballCentreY(
-                cloud.centreY,
-                cloud.visualScale,
-                cloud.ageTicks
-        );
-        double capRadius = getCurrentHorizontalRadius(
-                cloud.visualScale,
-                cloud.ageTicks
-        );
-        double capVerticalRadius = getCurrentVerticalRadius(
-                cloud.visualScale,
-                cloud.ageTicks
-        );
+        double capCentreY = getCloudHeadCentreY(cloud);
+        double capRadius = getCloudHorizontalRadius(cloud);
+        double capVerticalRadius = getCloudVerticalRadius(cloud);
         Vec3 eye = minecraft.player.getEyePosition();
         Vec3 centre = new Vec3(cloud.centreX, capCentreY, cloud.centreZ);
 
@@ -239,38 +429,14 @@ public final class DetonationParticleSystem {
         return false;
     }
 
-    private static boolean shouldCullForDistantLod(
-            double particleX,
-            double particleY,
-            double particleZ
-    ) {
-        for (ActiveCloud cloud : ACTIVE_CLOUDS) {
-            if (cloud.detailedParticlesVisible) {
-                continue;
-            }
-
-            double horizontalRadius = getLateExpandedCloudRadius(cloud.visualScale)
-                    * DetonationTuning.DistantHorizons.PARTICLE_CULL_CLOUD_RADIUS_MULTIPLIER;
-            double dx = particleX - cloud.centreX;
-            double dz = particleZ - cloud.centreZ;
-            if (dx * dx + dz * dz > horizontalRadius * horizontalRadius) {
-                continue;
-            }
-
-            double minimumY = cloud.centreY
-                    - getStemGroundExtension(cloud.visualScale)
-                    - 8.0D;
-            double maximumY = cloud.centreY
-                    + getStemHeight(cloud.visualScale)
-                    + getCurrentVerticalRadius(cloud.visualScale, cloud.ageTicks) * 2.0D;
-            if (particleY >= minimumY && particleY <= maximumY) {
-                return true;
-            }
-        }
-        return false;
-    }
+    // Existing smoke particles are not destroyed when a cloud temporarily
+    // leaves view. Spawning is already visibility-gated in tick(); particles
+    // themselves expire by lifetime, or by explicit clear generation changes.
+    // Previously every tinted smoke particle could be removed here, including
+    // the stem, when a cap-only visibility check failed for one tick.
 
     public static void clear() {
+        UNDERGROUND_EFFECTS.clear();
         ACTIVE_CLOUDS.clear();
         particleClearGeneration++;
     }
@@ -285,26 +451,16 @@ public final class DetonationParticleSystem {
                 new ArrayList<>(ACTIVE_CLOUDS.size());
 
         for (ActiveCloud cloud : ACTIVE_CLOUDS) {
-            double capCentreY = getFireballCentreY(
-                    cloud.centreY,
-                    cloud.visualScale,
-                    cloud.ageTicks
-            );
-            double capVerticalRadius = getCurrentVerticalRadius(
-                    cloud.visualScale,
-                    cloud.ageTicks
-            );
-            double stemAboveGroundHeight = Math.max(
-                    0.0D,
-                    capCentreY
-                            - cloud.centreY
-                            - capVerticalRadius * 0.36D
-            );
-            double stemGroundExtension = getStemGroundExtension(
-                    cloud.visualScale
-            );
-            double stemBaseY = cloud.centreY - stemGroundExtension;
-            double stemHeight = stemAboveGroundHeight + stemGroundExtension;
+            double capCentreY = getCloudHeadCentreY(cloud);
+            double capVerticalRadius = getCloudVerticalRadius(cloud);
+            // Surface stems use an immutable height/radius frame. No terrain
+            // sampling, no old ground-extension correction, no renderer-specific
+            // reconstruction after chunks unload.
+            SurfaceMushroomStem.Frame stem = SurfaceMushroomStem.frame(
+                    cloud.centreY, capCentreY, capVerticalRadius,
+                    cloud.visualScale, cloud.ageTicks);
+            double stemBaseY = stem.bottomY();
+            double stemHeight = stem.height();
 
             snapshots.add(
                     new CloudSnapshot(
@@ -315,22 +471,134 @@ public final class DetonationParticleSystem {
                             cloud.strength,
                             cloud.ageTicks,
                             capCentreY,
-                            getCurrentHorizontalRadius(
-                                    cloud.visualScale,
-                                    cloud.ageTicks
-                            ),
-                            capVerticalRadius,
+                            getCloudHorizontalRadius(cloud)
+                                    * (1.0D - getCapDissipation(cloud.ageTicks) * 0.96D),
+                            capVerticalRadius * (1.0D - getCapDissipation(cloud.ageTicks) * 0.70D),
                             stemBaseY,
                             stemHeight,
                             getAscentProgress(
                                     cloud.visualScale,
-                                    cloud.ageTicks
+                                    getFormationAge(cloud)
                             ) >= 1.0D
                     )
             );
         }
 
         return List.copyOf(snapshots);
+    }
+
+    private static boolean isBreakoutCloud(ActiveCloud cloud) {
+        return Double.isFinite(cloud.breakoutSurfaceY);
+    }
+
+    private static boolean isBreakoutTravelling(ActiveCloud cloud) {
+        return isBreakoutCloud(cloud) && cloud.ageTicks < cloud.breakoutTravelTicks;
+    }
+
+    private static int getFormationAge(ActiveCloud cloud) {
+        if (!isBreakoutCloud(cloud)) {
+            return cloud.ageTicks;
+        }
+        return Math.max(0, cloud.ageTicks - cloud.breakoutTravelTicks);
+    }
+
+    private static int getBloomAge(ActiveCloud cloud) {
+        if (!isBreakoutCloud(cloud)) {
+            return cloud.ageTicks;
+        }
+        if (isBreakoutTravelling(cloud)) {
+            return 0;
+        }
+        return DetonationTuning.ParticleCloud.EARLY_CAP_BLOOM_START_TICKS
+                + Math.max(
+                0,
+                getFormationAge(cloud)
+                        - DetonationTuning.ParticleCloud.BREAKOUT_PRECAP_BLOOM_TICKS
+        );
+    }
+
+    private static double getCloudHorizontalRadius(ActiveCloud cloud) {
+        double legacyRadius = getFireballRadius(cloud.visualScale);
+        if (isBreakoutTravelling(cloud)) {
+            return legacyRadius
+                    * DetonationTuning.ParticleCloud.BREAKOUT_FIREBALL_TRAVEL_RADIUS_RATIO;
+        }
+        if (isBreakoutCloud(cloud)
+                && getFormationAge(cloud)
+                < DetonationTuning.ParticleCloud.BREAKOUT_PRECAP_BLOOM_TICKS) {
+            double preCapProgress = easeOutCubic(
+                    getFormationAge(cloud)
+                            / (double) Math.max(
+                            1,
+                            DetonationTuning.ParticleCloud.BREAKOUT_PRECAP_BLOOM_TICKS
+                    )
+            );
+            return legacyRadius * lerp(
+                    DetonationTuning.ParticleCloud.BREAKOUT_FIREBALL_TRAVEL_RADIUS_RATIO,
+                    DetonationTuning.ParticleCloud.EARLY_CAP_INITIAL_RADIUS_RATIO,
+                    preCapProgress
+            );
+        }
+        return getCurrentHorizontalRadius(
+                cloud.visualScale,
+                getFormationAge(cloud),
+                getBloomAge(cloud)
+        );
+    }
+
+    private static double getCloudVerticalRadius(ActiveCloud cloud) {
+        double legacyRadius = getFireballRadius(cloud.visualScale);
+        if (isBreakoutTravelling(cloud)) {
+            return legacyRadius
+                    * DetonationTuning.ParticleCloud.BREAKOUT_FIREBALL_TRAVEL_RADIUS_RATIO
+                    * 0.90D;
+        }
+        if (isBreakoutCloud(cloud)
+                && getFormationAge(cloud)
+                < DetonationTuning.ParticleCloud.BREAKOUT_PRECAP_BLOOM_TICKS) {
+            double preCapProgress = easeOutCubic(
+                    getFormationAge(cloud)
+                            / (double) Math.max(
+                            1,
+                            DetonationTuning.ParticleCloud.BREAKOUT_PRECAP_BLOOM_TICKS
+                    )
+            );
+            return legacyRadius * lerp(
+                    DetonationTuning.ParticleCloud.BREAKOUT_FIREBALL_TRAVEL_RADIUS_RATIO,
+                    DetonationTuning.ParticleCloud.EARLY_CAP_INITIAL_RADIUS_RATIO,
+                    preCapProgress
+            ) * 0.90D;
+        }
+        return getCurrentVerticalRadius(
+                cloud.visualScale,
+                getFormationAge(cloud),
+                getBloomAge(cloud)
+        );
+    }
+
+    private static double getCloudHeadCentreY(ActiveCloud cloud) {
+        if (!isBreakoutCloud(cloud)) {
+            return getFireballCentreY(
+                    cloud.centreY,
+                    cloud.visualScale,
+                    cloud.ageTicks
+            );
+        }
+
+        double exitY = cloud.breakoutSurfaceY
+                + DetonationTuning.ParticleCloud.BREAKOUT_FIREBALL_SURFACE_CLEARANCE_BLOCKS;
+        if (cloud.ageTicks < cloud.breakoutTravelTicks) {
+            double travelProgress = easeOutCubic(
+                    cloud.ageTicks / (double) Math.max(1, cloud.breakoutTravelTicks)
+            );
+            return lerp(cloud.centreY + 2.0D, exitY, travelProgress);
+        }
+
+        double ascentProgress = getAscentProgress(
+                cloud.visualScale,
+                getFormationAge(cloud)
+        );
+        return exitY + getStemHeight(cloud.visualScale) * smoothstep(ascentProgress);
     }
 
     /**
@@ -357,6 +625,8 @@ public final class DetonationParticleSystem {
             ActiveCloud cloud
     ) {
         int age = cloud.ageTicks;
+        int formationAge = getFormationAge(cloud);
+        boolean travellingUnderground = isBreakoutTravelling(cloud);
 
         /*
          * There is deliberately no separate cap generator. The original
@@ -365,18 +635,49 @@ public final class DetonationParticleSystem {
         if (age <= DetonationTuning.ParticleCloud.FIREBALL_SPAWN_END_TICKS) {
             spawnFireball(level, cloud);
         }
+        if (travellingUnderground) {
+            spawnBreakoutPlasmaJet(level, cloud);
+        }
 
-        if (age >= DetonationTuning.ParticleCloud.STEM_START_TICKS) {
+        if (!travellingUnderground
+                && formationAge >= DetonationTuning.ParticleCloud.STEM_START_TICKS) {
             spawnStem(level, cloud);
             spawnStemBaseRing(level, cloud);
         }
 
-        if (age >= DetonationTuning.ParticleCloud.CRATER_EDGE_RING_START_TICKS) {
+        if (!travellingUnderground
+                && formationAge >= DetonationTuning.ParticleCloud.CRATER_EDGE_RING_START_TICKS) {
             spawnCraterEdgeRing(level, cloud);
         }
 
-        if (age >= getAscentDuration(cloud.visualScale)) {
+        if (!travellingUnderground
+                && formationAge >= getAscentDuration(cloud.visualScale)) {
             spawnCapUndersideRing(level, cloud);
+        }
+    }
+
+    /** A narrow incandescent jet trails the rising core along the excavated throat. */
+    private static void spawnBreakoutPlasmaJet(ClientLevel level, ActiveCloud cloud) {
+        double topY = getCloudHeadCentreY(cloud);
+        double originY = cloud.centreY;
+        double length = Math.max(0.0D, topY - originY);
+        double jetRadius = Math.clamp(getFireballRadius(cloud.visualScale) * 0.075D,
+                1.2D, 10.0D);
+        for (int i = 0; i < 42; i++) {
+            double progress = level.random.nextDouble();
+            double angle = level.random.nextDouble() * Mth.TWO_PI;
+            double radial = Math.sqrt(level.random.nextDouble()) * jetRadius
+                    * (0.35D + progress * 0.65D);
+            double x = cloud.centreX + Math.cos(angle) * radial;
+            double y = originY + length * progress;
+            double z = cloud.centreZ + Math.sin(angle) * radial;
+            if (!level.getBlockState(net.minecraft.core.BlockPos.containing(x, y, z)).isAir()) continue;
+            int start = i % 5 == 0 ? HOT_YELLOW : BRIGHT_ORANGE;
+            float size = (float) Math.clamp(jetRadius * 0.45D, 1.0D, 5.5D);
+            level.addParticle(new TintedPoofOptions(start, DEEP_ORANGE, size,
+                    size * 1.4F, 20 + level.random.nextInt(22),
+                    -0.001F, 0.93F, 0.03F, true), x, y, z,
+                    Math.cos(angle) * 0.01D, 0.11D, Math.sin(angle) * 0.01D);
         }
     }
 
@@ -393,25 +694,15 @@ public final class DetonationParticleSystem {
 
         double ascentProgress = getAscentProgress(
                 cloud.visualScale,
-                cloud.ageTicks
+                getFormationAge(cloud)
         );
 
         double morphProgress = slowMorph(
                 getMorphProgress(ascentProgress)
         );
-        double horizontalRadius = getCurrentHorizontalRadius(
-                cloud.visualScale,
-                cloud.ageTicks
-        );
-        double verticalRadius = getCurrentVerticalRadius(
-                cloud.visualScale,
-                cloud.ageTicks
-        );
-        double centreY = getFireballCentreY(
-                cloud.centreY,
-                cloud.visualScale,
-                cloud.ageTicks
-        );
+        double horizontalRadius = getCloudHorizontalRadius(cloud);
+        double verticalRadius = getCloudVerticalRadius(cloud);
+        double centreY = getCloudHeadCentreY(cloud);
 
         int count = Math.clamp(
                 (int) Math.round(
@@ -425,7 +716,7 @@ public final class DetonationParticleSystem {
         );
 
         boolean matureCloud =
-                cloud.ageTicks
+                getFormationAge(cloud)
                         >= DetonationTuning.ParticleCloud.MATURE_CLOUD_START_TICKS;
 
         if (matureCloud) {
@@ -444,6 +735,7 @@ public final class DetonationParticleSystem {
                     : 0.78D + level.random.nextDouble() * 0.22D;
 
             double radialFromAxis = horizontalDirection * radialFactor;
+            if (radialFactor > 1.0D - getCapDissipation(cloud.ageTicks) * 0.96D) continue;
             double offsetX = Math.cos(azimuth)
                     * horizontalRadius
                     * radialFromAxis;
@@ -504,6 +796,23 @@ public final class DetonationParticleSystem {
                     cloud.visualScale,
                     cloud.ageTicks
             );
+            if (radialFactor > 0.72D && cloud.ageTicks < fullSizeTick(cloud.visualScale)) {
+                // Mostly grey exterior, with intermittent incandescent pockets
+                // across the sides so the internal heat is visible off-axis.
+                int shell = getCapShellColour(cloud.visualScale, cloud.ageTicks, radialFactor);
+                if (cloud.ageTicks < 1250 && level.random.nextFloat() < 0.19F) {
+                    shell = interpolateRgb(shell, HOT_YELLOW,
+                            0.22D + level.random.nextDouble() * 0.28D);
+                }
+                palette = new FireballPalette(shell, shell, false);
+            } else if (radialFactor < 0.32D
+                    && cloud.ageTicks < getAscentDuration(cloud.visualScale)
+                    && level.random.nextFloat() < 0.32F) {
+                // Small, intermittent yellow pockets inside the orange head.
+                int core = getCapShellColour(cloud.visualScale, cloud.ageTicks, radialFactor);
+                palette = new FireballPalette(core, getCloudColour(cloud.visualScale,
+                        cloud.ageTicks + 25), cloud.ageTicks < 140);
+            }
 
             boolean smokePhase = thermalProgress >= 0.70D;
 
@@ -552,8 +861,7 @@ public final class DetonationParticleSystem {
         int next = getCloudColour(visualScale, ageTicks + 40);
         int startOffset = level.random.nextInt(17) - 10;
         int endOffset = level.random.nextInt(15) - 18;
-        boolean fullBright = ageTicks
-                < (int) (DetonationTuning.ParticleCloud.FIREBALL_COLOUR_TRANSITION_TICKS * 0.46D);
+        boolean fullBright = ageTicks < 140;
         return new FireballPalette(
                 adjustRgb(current, startOffset),
                 adjustRgb(next, endOffset),
@@ -561,165 +869,38 @@ public final class DetonationParticleSystem {
         );
     }
 
-    private static void spawnStem(
-            ClientLevel level,
-            ActiveCloud cloud
-    ) {
-        double headCentreY = getFireballCentreY(
-                cloud.centreY,
-                cloud.visualScale,
-                cloud.ageTicks
-        );
-        double headVerticalRadius = getCurrentVerticalRadius(
-                cloud.visualScale,
-                cloud.ageTicks
-        );
-
-        /*
-         * The stem follows directly behind the slowly rising fireball. It can
-         * never outrun the head or create a disconnected pre-built cap.
-         */
-        double stemAboveGroundHeight = Math.max(
-                0.0D,
-                headCentreY
-                        - cloud.centreY
-                        - headVerticalRadius * 0.36D
-        );
-        double stemGroundExtension = getStemGroundExtension(cloud.visualScale);
-        double stemBaseY = cloud.centreY - stemGroundExtension;
-        double stemHeight = stemAboveGroundHeight + stemGroundExtension;
-
-        if (stemHeight <= 0.5D) {
-            return;
-        }
-
-        double matureCloudRadius = getMatureCloudRadius(cloud.visualScale);
-
-        /*
-         * The stem begins as a narrow column and does not start widening until
-         * the rising fireball has already begun spreading into the mushroom
-         * head. This prevents the stem from thickening before the cap forms.
-         */
-        double ascentProgress = getAscentProgress(
-                cloud.visualScale,
-                cloud.ageTicks
-        );
-
-        double headMorphProgress = getMorphProgress(ascentProgress);
-
-        double stemWidenProgress = Math.clamp(
-                (headMorphProgress
-                        - DetonationTuning.ParticleCloud.STEM_WIDEN_START_MORPH_RATIO)
-                        / (1.0D
-                        - DetonationTuning.ParticleCloud.STEM_WIDEN_START_MORPH_RATIO),
-                0.0D,
-                1.0D
-        );
-
-        stemWidenProgress = Math.pow(
-                smoothstep(stemWidenProgress),
-                DetonationTuning.ParticleCloud.STEM_WIDEN_POWER
-        );
-
-        double stemRadiusRatio = lerp(
-                DetonationTuning.ParticleCloud.STEM_INITIAL_RADIUS_RATIO,
-                DetonationTuning.ParticleCloud.STEM_RADIUS_RATIO,
-                stemWidenProgress
-        );
-
-        double stemRadius = Math.max(
-                2.0D,
-                matureCloudRadius * stemRadiusRatio
-        );
-
-        int count = Math.clamp(
-                (int) Math.round(
-                        DetonationTuning.ParticleCloud.STEM_PARTICLES_BASE
-                                + stemHeight
-                                * DetonationTuning.ParticleCloud.STEM_PARTICLES_PER_HEIGHT
-                ),
-                DetonationTuning.ParticleCloud.STEM_PARTICLES_MIN,
-                DetonationTuning.ParticleCloud.STEM_PARTICLES_MAX
-        );
-
-        boolean matureCloud =
-                cloud.ageTicks
-                        >= DetonationTuning.ParticleCloud.MATURE_CLOUD_START_TICKS;
-
-        if (matureCloud) {
-            count = DetonationTuning.ParticleCloud.MATURE_STEM_PARTICLES_PER_TICK;
-        }
-
-        for (int index = 0; index < count; index++) {
-            double heightProgress = level.random.nextDouble();
-
-            /*
-             * Preserve the exact bottom and top widths, but pull the middle
-             * inward to give the stem a stronger curved silhouette. Because
-             * sin(0) and sin(pi) are both zero, the end widths are unchanged.
-             */
-            double verticalTaper = 1.05D
-                    - 0.47D * smoothstep(heightProgress);
-            double middleCurve = 1.0D
-                    - DetonationTuning.ParticleCloud.STEM_MIDDLE_CURVE_STRENGTH
-                    * Math.pow(
-                    Math.sin(heightProgress * Math.PI),
-                    DetonationTuning.ParticleCloud.STEM_MIDDLE_CURVE_POWER
-            );
-            double localRadius = stemRadius * verticalTaper * middleCurve;
+    /** One continuous particulate stem using the same deterministic frame as
+     * the voxel renderer. No separate core, sheath, or terrain-height lookup. */
+    private static void spawnStem(ClientLevel level, ActiveCloud cloud) {
+        SurfaceMushroomStem.Frame frame = SurfaceMushroomStem.frame(
+                cloud.centreY, getCloudHeadCentreY(cloud), getCloudVerticalRadius(cloud),
+                cloud.visualScale, cloud.ageTicks);
+        if (!frame.visible()) return;
+        boolean mature = getFormationAge(cloud)
+                >= DetonationTuning.ParticleCloud.MATURE_CLOUD_START_TICKS;
+        int count = mature ? 18 : Math.clamp(
+                (int) Math.round(38.0D + frame.height() * 0.60D), 40, 185);
+        for (int i = 0; i < count; i++) {
+            double h = level.random.nextDouble();
+            double radius = SurfaceMushroomStem.radius(frame, h);
             double angle = level.random.nextDouble() * Mth.TWO_PI;
-            double distance = localRadius * Math.sqrt(level.random.nextDouble());
-
-            double x = cloud.centreX + Math.cos(angle) * distance;
-            double y = stemBaseY + stemHeight * heightProgress;
-            double z = cloud.centreZ + Math.sin(angle) * distance;
-
-            float size = (float) Math.clamp(
-                    localRadius * (0.24D + level.random.nextDouble() * 0.20D),
-                    DetonationTuning.ParticleCloud.MIN_POOF_SCALE,
-                    DetonationTuning.ParticleCloud.MAX_SMOKE_POOF_SCALE
-            );
-
-            int thermalColour = getCloudColour(cloud.visualScale, cloud.ageTicks);
-            int nextThermalColour = getCloudColour(cloud.visualScale, cloud.ageTicks + 55);
-            int heightShade = (int) Math.round(-18.0D + heightProgress * 8.0D);
-            int startColour = adjustRgb(
-                    thermalColour,
-                    heightShade + level.random.nextInt(13) - 6
-            );
-            int endColour = adjustRgb(
-                    nextThermalColour,
-                    heightShade - 10 + level.random.nextInt(9) - 4
-            );
-
-            int lifetime = matureCloud
-                    ? DetonationTuning.ParticleCloud.MATURE_PARTICLE_LIFETIME_MIN
-                    + level.random.nextInt(
-                    DetonationTuning.ParticleCloud.MATURE_PARTICLE_LIFETIME_VARIATION
-            )
-                    : 70 + level.random.nextInt(70);
-
-            TintedPoofOptions options = new TintedPoofOptions(
-                    startColour,
-                    endColour,
-                    size,
-                    size * (1.65F + level.random.nextFloat() * 0.60F),
-                    lifetime,
-                    matureCloud ? -0.0007F : -0.0025F,
-                    matureCloud ? 0.985F : 0.955F,
-                    0.02F,
-                    false
-            );
-
-            level.addParticle(
-                    options,
-                    x,
-                    y,
-                    z,
-                    Math.cos(angle) * 0.008D,
-                    0.018D + level.random.nextDouble() * 0.028D,
-                    Math.sin(angle) * 0.008D
-            );
+            double radialFraction = Math.sqrt(level.random.nextDouble());
+            double x = cloud.centreX + Math.cos(angle) * radius * radialFraction;
+            double y = frame.bottomY() + frame.height() * h;
+            double z = cloud.centreZ + Math.sin(angle) * radius * radialFraction;
+            int start = SurfaceMushroomStem.colour(cloud.visualScale, cloud.ageTicks, h);
+            int end = SurfaceMushroomStem.colour(cloud.visualScale, cloud.ageTicks + 65, h);
+            float size = (float) Math.clamp(radius * (0.20D + level.random.nextDouble() * 0.17D),
+                    1.5D, 14.0D);
+            int lifetime = mature ? 300 + level.random.nextInt(180)
+                    : 85 + level.random.nextInt(60);
+            level.addParticle(new TintedPoofOptions(start, end, size,
+                            size * (1.48F + level.random.nextFloat() * 0.38F),
+                            lifetime, mature ? -0.0006F : -0.002F,
+                            mature ? 0.984F : 0.957F, 0.02F, false),
+                    x, y, z, Math.cos(angle) * 0.004D,
+                    0.010D + level.random.nextDouble() * 0.016D,
+                    Math.sin(angle) * 0.004D);
         }
     }
 
@@ -732,19 +913,18 @@ public final class DetonationParticleSystem {
             ActiveCloud cloud
     ) {
         boolean matureCloud =
-                cloud.ageTicks
+                getFormationAge(cloud)
                         >= DetonationTuning.ParticleCloud.MATURE_CLOUD_START_TICKS;
 
         int count = matureCloud
                 ? DetonationTuning.ParticleCloud.MATURE_STEM_BASE_RING_PARTICLES_PER_TICK
                 : DetonationTuning.ParticleCloud.STEM_BASE_RING_PARTICLES_PER_TICK;
 
-        double fireballRadius = getFireballRadius(cloud.visualScale);
-        double ringRadius = Math.max(
-                DetonationTuning.ParticleCloud.STEM_BASE_RING_MINIMUM_RADIUS,
-                fireballRadius
-                        * DetonationTuning.ParticleCloud.STEM_BASE_RING_RADIUS_RATIO
-        );
+        SurfaceMushroomStem.Frame frame = SurfaceMushroomStem.frame(
+                cloud.centreY, getCloudHeadCentreY(cloud), getCloudVerticalRadius(cloud),
+                cloud.visualScale, cloud.ageTicks);
+        if (!frame.visible()) return;
+        double ringRadius = Math.max(1.75D, frame.baseRadius() * 0.73D);
         double ringThickness = Math.max(
                 0.35D,
                 ringRadius
@@ -759,8 +939,7 @@ public final class DetonationParticleSystem {
             double cos = Math.cos(angle);
             double sin = Math.sin(angle);
             double x = cloud.centreX + cos * radius;
-            double y = cloud.centreY
-                    + 0.20D
+            double y = frame.bottomY() + 0.20D
                     + level.random.nextDouble() * 0.45D;
             double z = cloud.centreZ + sin * radius;
 
@@ -817,13 +996,13 @@ public final class DetonationParticleSystem {
             ClientLevel level,
             ActiveCloud cloud
     ) {
-        double visibility = getCraterRingVisibility(cloud.ageTicks);
+        double visibility = getCraterRingVisibility(getFormationAge(cloud));
         if (visibility <= 0.0D) {
             return;
         }
 
         boolean matureCloud =
-                cloud.ageTicks
+                getFormationAge(cloud)
                         >= DetonationTuning.ParticleCloud.MATURE_CLOUD_START_TICKS;
 
         int baseCount = matureCloud
@@ -912,49 +1091,28 @@ public final class DetonationParticleSystem {
             ClientLevel level,
             ActiveCloud cloud
     ) {
-        int ticksSinceTop = Math.max(
-                0,
-                cloud.ageTicks - getAscentDuration(cloud.visualScale)
-        );
-
-        double fadeProgress = smoothstep(
-                Math.clamp(
-                        ticksSinceTop
-                                / (double) DetonationTuning.ParticleCloud.CAP_UNDERSIDE_RING_FADE_IN_TICKS,
-                        0.0D,
-                        1.0D
-                )
-        );
+        double fadeProgress = getCapUndersideRingVisibility(
+                cloud.visualScale, getFormationAge(cloud));
 
         if (fadeProgress <= 0.0D) {
             return;
         }
 
         boolean matureCloud =
-                cloud.ageTicks
+                getFormationAge(cloud)
                         >= DetonationTuning.ParticleCloud.MATURE_CLOUD_START_TICKS;
 
         int targetCount = matureCloud
                 ? DetonationTuning.ParticleCloud.MATURE_CAP_UNDERSIDE_RING_PARTICLES_PER_TICK
                 : DetonationTuning.ParticleCloud.CAP_UNDERSIDE_RING_PARTICLES_PER_TICK;
-        int count = Math.max(
-                1,
-                (int) Math.ceil(targetCount * fadeProgress)
-        );
+        // No first-tick smoke burst: the underside collar builds gradually.
+        int count = Math.max(0,
+                (int) Math.floor(targetCount * fadeProgress));
+        if (count == 0) return;
 
-        double capRadius = getCurrentHorizontalRadius(
-                cloud.visualScale,
-                cloud.ageTicks
-        );
-        double capVerticalRadius = getCurrentVerticalRadius(
-                cloud.visualScale,
-                cloud.ageTicks
-        );
-        double capCentreY = getFireballCentreY(
-                cloud.centreY,
-                cloud.visualScale,
-                cloud.ageTicks
-        );
+        double capRadius = getCloudHorizontalRadius(cloud);
+        double capVerticalRadius = getCloudVerticalRadius(cloud);
+        double capCentreY = getCloudHeadCentreY(cloud);
 
         double ringRadius = Math.max(
                 DetonationTuning.ParticleCloud.CAP_UNDERSIDE_RING_MINIMUM_RADIUS,
@@ -1152,7 +1310,7 @@ public final class DetonationParticleSystem {
     }
 
     private static double getEarlyCapBloomProgress(int ageTicks) {
-        return smoothstep(Math.clamp(
+        return easeOutCubic(Math.clamp(
                 (ageTicks - DetonationTuning.ParticleCloud.EARLY_CAP_BLOOM_START_TICKS)
                         / (double) Math.max(
                         1,
@@ -1167,8 +1325,16 @@ public final class DetonationParticleSystem {
             float visualScale,
             int ageTicks
     ) {
+        return getCurrentHorizontalRadius(visualScale, ageTicks, ageTicks);
+    }
+
+    private static double getCurrentHorizontalRadius(
+            float visualScale,
+            int ageTicks,
+            int bloomAgeTicks
+    ) {
         double legacyStartRadius = getFireballRadius(visualScale);
-        double bloomProgress = getEarlyCapBloomProgress(ageTicks);
+        double bloomProgress = getEarlyCapBloomProgress(bloomAgeTicks);
         double compactStartRadius = legacyStartRadius
                 * DetonationTuning.ParticleCloud.EARLY_CAP_INITIAL_RADIUS_RATIO;
         double fireballRadius = lerp(
@@ -1202,8 +1368,16 @@ public final class DetonationParticleSystem {
             float visualScale,
             int ageTicks
     ) {
+        return getCurrentVerticalRadius(visualScale, ageTicks, ageTicks);
+    }
+
+    private static double getCurrentVerticalRadius(
+            float visualScale,
+            int ageTicks,
+            int bloomAgeTicks
+    ) {
         double legacyStartRadius = getFireballRadius(visualScale);
-        double bloomProgress = getEarlyCapBloomProgress(ageTicks);
+        double bloomProgress = getEarlyCapBloomProgress(bloomAgeTicks);
         double fireballRadius = lerp(
                 legacyStartRadius * DetonationTuning.ParticleCloud.EARLY_CAP_INITIAL_RADIUS_RATIO,
                 legacyStartRadius,
@@ -1242,65 +1416,139 @@ public final class DetonationParticleSystem {
     }
 
 
-    /** Smooth shared thermal colour for particle, VOXEL and DH renderers. */
+    /** Post-fireball exterior: dusty tan/brown-grey with a hot inner cap.
+     * The cap darkens gradually without making its entire outer volume stay
+     * bright orange for minutes. All near and distant voxel render paths use
+     * this same palette, while getCapShellColour adds the yellow hot centre. */
     public static int getThermalCloudColour(int ageTicks) {
-        int duration = Math.max(1, DetonationTuning.ParticleCloud.FIREBALL_COLOUR_TRANSITION_TICKS);
-        double progress = Math.clamp(ageTicks / (double) duration, 0.0D, 1.0D);
-
-        int thermal;
-        if (progress < 0.12D) {
-            thermal = interpolateRgb(WHITE_HOT, PALE_YELLOW, progress / 0.12D);
-        } else if (progress < 0.24D) {
-            thermal = interpolateRgb(PALE_YELLOW, HOT_YELLOW, (progress - 0.12D) / 0.12D);
-        } else if (progress < 0.72D) {
-            thermal = interpolateRgb(HOT_YELLOW, BRIGHT_ORANGE, (progress - 0.24D) / 0.48D);
-        } else if (progress < 0.88D) {
-            thermal = interpolateRgb(BRIGHT_ORANGE, BURNT_BROWN, (progress - 0.72D) / 0.16D);
-        } else {
-            thermal = interpolateRgb(BURNT_BROWN, MATURE_SMOKE_GREY, (progress - 0.88D) / 0.12D);
-        }
-
-        return thermal;
+        int age = Math.max(0, ageTicks);
+        if (age < 24) return interpolateRgb(WHITE_HOT, HOT_YELLOW, age / 24.0D);
+        if (age < 95) return interpolateRgb(HOT_YELLOW, BRIGHT_ORANGE,
+                (age - 24) / 71.0D);
+        int thermal = DetonationTuning.ParticleCloud.FIREBALL_COLOUR_TRANSITION_TICKS;
+        int brownStart = Math.max(110, (int) Math.round(thermal * 0.10D));
+        int brownEnd = Math.max(brownStart + 1, (int) Math.round(thermal * 0.22D));
+        int greyStart = Math.max(brownEnd + 1, (int) Math.round(thermal * 0.54D));
+        int greyEnd = Math.max(greyStart + 1, (int) Math.round(thermal * 0.82D));
+        if (age < brownStart) return BRIGHT_ORANGE;
+        if (age < brownEnd) return interpolateRgb(BRIGHT_ORANGE, 0x847164,
+                smoothstep((age - brownStart) / (double) (brownEnd - brownStart)));
+        if (age < greyStart) return interpolateRgb(0x847164, 0x60574F,
+                smoothstep((age - brownEnd) / (double) (greyStart - brownEnd)));
+        if (age < greyEnd) return interpolateRgb(0x60574F, DARK_GREY,
+                smoothstep((age - greyStart) / (double) (greyEnd - greyStart)));
+        if (age < thermal) return interpolateRgb(DARK_GREY, MATURE_SMOKE_GREY,
+                smoothstep((age - greyEnd) / (double) Math.max(1, thermal - greyEnd)));
+        return MATURE_SMOKE_GREY;
     }
 
-    /** Shared mushroom colour including the post-full-size smoke lightening. */
-    public static int getCloudColour(float visualScale, int ageTicks) {
-        int base = getThermalCloudColour(ageTicks);
-        int fullSizeTick = getAscentDuration(visualScale)
+    public static int fullSizeTick(float visualScale) {
+        return getAscentDuration(visualScale)
                 + DetonationTuning.ParticleCloud.LATE_CAP_EXPANSION_DELAY_TICKS
                 + DetonationTuning.ParticleCloud.LATE_CAP_EXPANSION_DURATION_TICKS;
-        if (ageTicks <= fullSizeTick) {
-            return base;
-        }
+    }
 
-        double matureProgress = smoothstep(Math.clamp(
-                (ageTicks - fullSizeTick)
-                        / (double) Math.max(
-                        1,
-                        DetonationTuning.ParticleCloud.MATURE_GREY_LIGHTEN_DURATION_TICKS
-                ),
-                0.0D,
-                1.0D
-        ));
+    public static double getStemDissipation(int ageTicks) {
+        return SurfaceMushroomStem.retreat(ageTicks);
+    }
+
+    public static double getCapDissipation(int ageTicks) {
+        return smoothstep(Math.clamp(
+                (ageTicks / (double) DetonationTuning.ParticleCloud.TOTAL_LIFETIME_TICKS
+                - DetonationTuning.ParticleCloud.CAP_DISSIPATION_START_FRACTION)
+                / (DetonationTuning.ParticleCloud.CAP_DISSIPATION_END_FRACTION
+                - DetonationTuning.ParticleCloud.CAP_DISSIPATION_START_FRACTION), 0.0D, 1.0D));
+    }
+
+    /** Compatibility helpers: all stem colour now comes from the new model. */
+    public static int getStemLayerColour(float scale, int age,
+                                         double heightProgress, int shade) {
+        return adjustRgb(SurfaceMushroomStem.colour(scale, age, heightProgress), shade);
+    }
+
+    public static int getStemBandColour(float scale, int age,
+                                        double heightProgress, int ignoredUnderlyingRgb) {
+        return SurfaceMushroomStem.colour(scale, age, heightProgress);
+    }
+
+    /** Dark smoke skin around a still-hot yellow/orange/red interior.
+     *
+     * The outside cools earlier than the inner volume, but stays charcoal,
+     * never the pale red-grey of the previous iteration. Radial colour is
+     * shared by the close voxel renderer and the DH cloud builder so their
+     * silhouettes and hot internal pockets remain consistent.
+     */
+    public static int getCapShellColour(float visualScale, int ageTicks, double radialProgress) {
+        double radial = Math.clamp(radialProgress, 0.0D, 1.0D);
+        int age = Math.max(0, ageTicks);
+        int smokeBase = getCloudColour(visualScale, age);
+
+        // During the first ignition frames keep the familiar orange fireball.
+        double smokeFormation = smoothstep(Math.clamp((age - 85.0D) / 340.0D, 0.0D, 1.0D));
+        int charcoal = interpolateRgb(0x494B45, 0x343B39,
+                smoothstep(Math.clamp((age - 100.0D) / 500.0D, 0.0D, 1.0D)));
+        // The shell still ages to normal grey; only its *formation* is dark.
+        int cooledShell = interpolateRgb(charcoal, MATURE_SMOKE_GREY,
+                smoothstep(Math.clamp((age - 1250.0D) / 850.0D, 0.0D, 1.0D)));
+        double shell = smoothstep(Math.clamp((radial - 0.51D) / 0.47D, 0.0D, 1.0D));
+        int smoky = interpolateRgb(smokeBase, cooledShell,
+                smokeFormation * (0.46D + shell * 0.54D));
+
+        // The hot cap's interior remains red at the fringes, orange inside,
+        // and yellow nearer the centre. As the heat cools, the smoke is still
+        // visible but the inner glow dies away before maturity.
+        double heat = 1.0D - smoothstep(Math.clamp((age - 320.0D) / 1290.0D, 0.0D, 1.0D));
+        double core = 1.0D - smoothstep(Math.clamp((radial - 0.13D) / 0.79D, 0.0D, 1.0D));
+        int hot = interpolateRgb(0xDB5732, 0xF6AE37,
+                1.0D - smoothstep(Math.clamp((radial - 0.24D) / 0.49D, 0.0D, 1.0D)));
+        // Reserve a small bright-yellow kernel rather than bleaching the cap.
+        hot = interpolateRgb(hot, 0xFFD965,
+                (1.0D - smoothstep(Math.clamp(radial / 0.33D, 0.0D, 1.0D))) * 0.38D);
+        return interpolateRgb(smoky, hot, core * heat * (0.55D + 0.25D * (1.0D - shell)));
+    }
+
+    /** A dense centre with a continuously translucent outer smoke layer.
+     * Kept throughout the cloud lifecycle; dissipation is an additional
+     * multiplier, not a sudden change from opaque to transparent.
+     */
+    public static int getCapShellAlpha(float visualScale, int ageTicks, double radialProgress) {
+        double radial = Math.clamp(radialProgress, 0.0D, 1.0D);
+        double outer = smoothstep(Math.clamp((radial - 0.43D) / 0.57D, 0.0D, 1.0D));
+        int base = (int) Math.round(248.0D - 40.0D * outer);
+        return Math.clamp((int) Math.round(base
+                * getCloudVoxelAlpha(ageTicks) / 255.0D), 0, 255);
+    }
+
+    public static int getStemVoxelAlpha(int ageTicks, double radialProgress) {
+        return SurfaceMushroomStem.opacity(ageTicks, radialProgress);
+    }
+
+    public static int getCloudColour(float visualScale, int ageTicks) {
+        int base = getThermalCloudColour(ageTicks);
+        int fullSize = fullSizeTick(visualScale);
+        if (ageTicks <= fullSize) return base;
+        double matureProgress = smoothstep(Math.clamp((ageTicks - fullSize)
+                / (double) Math.max(1,
+                    DetonationTuning.ParticleCloud.MATURE_GREY_LIGHTEN_DURATION_TICKS),
+                0.0D, 1.0D));
         return interpolateRgb(base, LIGHT_MATURE_SMOKE_GREY, matureProgress);
     }
 
-    /** Dense mushroom cloud: fully opaque early, only mildly translucent when old. */
+    /** Stay dense throughout maturity; opacity only drops after dissipation begins. */
     public static int getCloudVoxelAlpha(int ageTicks) {
-        int thermalEnd = DetonationTuning.ParticleCloud.FIREBALL_COLOUR_TRANSITION_TICKS;
-        int matureStart = DetonationTuning.ParticleCloud.MATURE_CLOUD_START_TICKS;
-        int total = DetonationTuning.ParticleCloud.TOTAL_LIFETIME_TICKS;
-        if (ageTicks <= thermalEnd) {
-            return 255;
-        }
-        if (ageTicks <= matureStart) {
-            double progress = (ageTicks - thermalEnd)
-                    / (double) Math.max(1, matureStart - thermalEnd);
-            return (int) Math.round(lerp(255.0D, 242.0D, smoothstep(progress)));
-        }
-        double progress = (ageTicks - matureStart)
-                / (double) Math.max(1, total - matureStart);
-        return (int) Math.round(lerp(242.0D, 230.0D, smoothstep(progress)));
+        double fraction = ageTicks / (double) DetonationTuning.ParticleCloud.TOTAL_LIFETIME_TICKS;
+        // Radius shrinks from the outside first. The tiny remaining central cap
+        // gets an opacity fade only during the final moments.
+        double lastFade = smoothstep(Math.clamp((fraction - 0.985D) / 0.015D,
+                0.0D, 1.0D));
+        return (int) Math.round(255.0D * (1.0D - lastFade));
+    }
+
+    public static double getCapUndersideRingVisibility(float visualScale, int ageTicks) {
+        int sinceArrival = ageTicks - getAscentDuration(visualScale);
+        if (sinceArrival <= 0) return 0.0D;
+        return smoothstep(Math.clamp(sinceArrival / (double) Math.max(1,
+                DetonationTuning.ParticleCloud.CAP_UNDERSIDE_RING_FADE_IN_TICKS), 0.0D, 1.0D));
     }
 
     public static double getCraterRingVisibility(int ageTicks) {
@@ -1409,9 +1657,12 @@ public final class DetonationParticleSystem {
         private final double centreZ;
         private final float visualScale;
         private final float strength;
+        private final double breakoutSurfaceY;
+        private final int breakoutTravelTicks;
 
         private int ageTicks;
         private boolean detailedParticlesVisible = true;
+        private String lastStage = "";
 
         private ActiveCloud(
                 double centreX,
@@ -1419,6 +1670,7 @@ public final class DetonationParticleSystem {
                 double centreZ,
                 float visualScale,
                 float strength,
+                double breakoutSurfaceY,
                 int ageTicks
         ) {
             this.centreX = centreX;
@@ -1426,6 +1678,18 @@ public final class DetonationParticleSystem {
             this.centreZ = centreZ;
             this.visualScale = visualScale;
             this.strength = strength;
+            this.breakoutSurfaceY = breakoutSurfaceY;
+            this.breakoutTravelTicks = Double.isFinite(breakoutSurfaceY)
+                    ? Math.clamp(
+                    (int) Math.ceil(
+                            Math.max(0.0D, breakoutSurfaceY - centreY)
+                                    / DetonationTuning.ParticleCloud
+                                    .BREAKOUT_FIREBALL_SPEED_BLOCKS_PER_TICK
+                    ),
+                    DetonationTuning.ParticleCloud.BREAKOUT_FIREBALL_MINIMUM_TRAVEL_TICKS,
+                    DetonationTuning.ParticleCloud.BREAKOUT_FIREBALL_MAXIMUM_TRAVEL_TICKS
+            )
+                    : 0;
             this.ageTicks = Math.max(0, ageTicks);
         }
     }
@@ -1473,6 +1737,7 @@ public final class DetonationParticleSystem {
         private final float startScale;
         private final float endScale;
         private final float endAlpha;
+        private final float initialAlpha;
         private final boolean fullBright;
         private final int creationClearGeneration;
 
@@ -1503,6 +1768,7 @@ public final class DetonationParticleSystem {
             this.startScale = options.startScale();
             this.endScale = options.endScale();
             this.endAlpha = options.endAlpha();
+            this.initialAlpha = Math.clamp(options.initialAlpha(), 0.0F, 1.0F);
             this.fullBright = options.fullBright();
             this.creationClearGeneration = particleClearGeneration;
 
@@ -1520,11 +1786,6 @@ public final class DetonationParticleSystem {
         @Override
         public void tick() {
             if (this.creationClearGeneration != particleClearGeneration) {
-                this.remove();
-                return;
-            }
-
-            if (shouldCullForDistantLod(this.x, this.y, this.z)) {
                 this.remove();
                 return;
             }
@@ -1582,15 +1843,14 @@ public final class DetonationParticleSystem {
 
             this.quadSize = Mth.lerp(eased, startScale, endScale);
 
-            float lateFade = progress <= 0.72F
+            // Individual poofs overlap densely throughout their life; fade only
+            // at their very end to avoid an unnaturally hollow mushroom.
+            float lateFade = progress <= 0.90F
                     ? 1.0F
-                    : 1.0F - (progress - 0.72F) / 0.28F;
+                    : 1.0F - (progress - 0.90F) / 0.10F;
 
             this.setAlpha(
-                    Math.max(
-                            endAlpha,
-                            lateFade
-                    )
+                    Math.min(initialAlpha, Math.max(endAlpha, lateFade))
             );
         }
     }

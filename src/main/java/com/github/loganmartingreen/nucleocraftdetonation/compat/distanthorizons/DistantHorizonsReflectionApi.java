@@ -32,10 +32,6 @@ final class DistantHorizonsReflectionApi {
             "com.seibel.distanthorizons.api.objects.render.DhApiRenderableBox";
     private static final String DH_MATERIAL =
             "com.seibel.distanthorizons.api.enums.rendering.EDhApiBlockMaterial";
-    private static final String DH_FOG_COLOUR =
-            "com.seibel.distanthorizons.api.enums.rendering.EDhApiFogColorMode";
-    private static final String DH_FOG_DRAW_MODE =
-            "com.seibel.distanthorizons.api.enums.rendering.EDhApiFogDrawMode";
 
     private final Logger logger;
     private final Set<Object> overriddenConfigValues =
@@ -156,131 +152,6 @@ final class DistantHorizonsReflectionApi {
         return null;
     }
 
-    void applyFalloutFog(float intensity) {
-        if (!tryInitialize()) {
-            return;
-        }
-
-        intensity = Math.clamp(intensity, 0.0F, 1.0F);
-
-        try {
-            Object graphics = invoke(configs, "graphics");
-            Object fog = firstConfigObject(
-                    graphics,
-                    "fog",
-                    "fogQuality"
-            );
-            if (fog == null) {
-                return;
-            }
-
-            /* Keep Minecraft's near fog active while also fogging DH LODs.
-             * Different DH generations expose this as either enable- or
-             * disableVanillaFog, so support both without hard-linking DH. */
-            Object enableVanillaFog = invokeOptional(fog, "enableVanillaFog");
-            if (enableVanillaFog != null) {
-                overrideConfig(enableVanillaFog, true);
-            } else {
-                overrideConfig(invokeOptional(fog, "disableVanillaFog"), false);
-            }
-
-            Object enableDhFog = invokeOptional(fog, "enableDhFog");
-            if (enableDhFog != null) {
-                overrideConfig(enableDhFog, true);
-            } else {
-                overrideConfig(
-                        firstConfigValue(fog, "drawMode", "fogDrawMode"),
-                        enumValue(DH_FOG_DRAW_MODE, "FOG_ENABLED")
-                );
-            }
-
-            overrideConfig(
-                    firstConfigValue(fog, "color", "colorMode", "fogColorMode"),
-                    enumValue(DH_FOG_COLOUR, "USE_WORLD_FOG_COLOR")
-            );
-
-            Object farFog = firstConfigObject(
-                    fog,
-                    "farFog",
-                    "advancedFog"
-            );
-            if (farFog == null) {
-                /* Newer API layouts expose far-fog values directly on fog. */
-                farFog = fog;
-            }
-
-            double startDistance = lerp(
-                    0.18D,
-                    DetonationTuning.Fallout.DH_FOG_START,
-                    intensity
-            );
-            double endDistance = lerp(
-                    0.92D,
-                    DetonationTuning.Fallout.DH_FOG_END,
-                    intensity
-            );
-            double minThickness = DetonationTuning.Fallout.DH_FOG_MIN_THICKNESS
-                    * intensity;
-            double maxThickness = lerp(
-                    0.30D,
-                    DetonationTuning.Fallout.DH_FOG_MAX_THICKNESS,
-                    intensity
-            );
-            double density = lerp(
-                    0.75D,
-                    DetonationTuning.Fallout.DH_FOG_DENSITY,
-                    intensity
-            );
-
-            overrideNumeric(
-                    firstConfigValue(farFog, "farFogStartDistance", "farFogStart"),
-                    startDistance
-            );
-            overrideNumeric(
-                    firstConfigValue(farFog, "farFogEndDistance", "farFogEnd"),
-                    endDistance
-            );
-            overrideNumeric(
-                    firstConfigValue(farFog, "farFogMinThickness", "farFogMin"),
-                    minThickness
-            );
-            overrideNumeric(
-                    firstConfigValue(farFog, "farFogMaxThickness", "farFogMax"),
-                    maxThickness
-            );
-            overrideNumeric(
-                    firstConfigValue(farFog, "farFogDensity"),
-                    density
-            );
-        } catch (ReflectiveOperationException | RuntimeException exception) {
-            warnOnce("Unable to apply Distant Horizons fallout fog.", exception);
-        }
-    }
-
-    private static Object firstConfigObject(
-            Object target,
-            String... methodNames
-    ) throws ReflectiveOperationException {
-        for (String methodName : methodNames) {
-            Object value = invokeOptional(target, methodName);
-            if (value != null) {
-                return value;
-            }
-        }
-        return null;
-    }
-
-    private static Object firstConfigValue(
-            Object target,
-            String... methodNames
-    ) throws ReflectiveOperationException {
-        return firstConfigObject(target, methodNames);
-    }
-
-    private static double lerp(double from, double to, double progress) {
-        return from + (to - from) * Math.clamp(progress, 0.0D, 1.0D);
-    }
-
     void enableGenericRendering() {
         if (!tryInitialize()
                 || genericRenderingConfigValue != null
@@ -298,17 +169,6 @@ final class DistantHorizonsReflectionApi {
             overrideConfig(genericRenderingConfigValue, true);
         } catch (ReflectiveOperationException | RuntimeException exception) {
             warnOnce("Unable to enable Distant Horizons generic rendering.", exception);
-        }
-    }
-
-    void clearFogOverrides() {
-        List<Object> values = new ArrayList<>(overriddenConfigValues);
-
-        for (Object value : values) {
-            if (value == genericRenderingConfigValue) {
-                continue;
-            }
-            clearOverride(value);
         }
     }
 
@@ -470,28 +330,6 @@ final class DistantHorizonsReflectionApi {
             warnOnce("Unable to submit changed chunks to Distant Horizons.", exception);
             return false;
         }
-    }
-
-    private void overrideNumeric(
-            Object configValue,
-            double value
-    ) throws ReflectiveOperationException {
-        if (configValue == null) {
-            return;
-        }
-
-        Object reference = invokeOptional(configValue, "getDefaultValue");
-        Object typedValue;
-
-        if (reference instanceof Float) {
-            typedValue = (float) value;
-        } else if (reference instanceof Integer) {
-            typedValue = (int) Math.round(value);
-        } else {
-            typedValue = value;
-        }
-
-        overrideConfig(configValue, typedValue);
     }
 
     private void overrideConfig(

@@ -44,6 +44,8 @@ public final class DetonationSavedData extends SavedData {
     private static final String VISUAL_SCALE_TAG = "VisualScale";
     private static final String CLOUD_AGE_TAG = "CloudAge";
     private static final String CLOUD_STRENGTH_TAG = "CloudStrength";
+    private static final String CLOUD_EXIT_Y_TAG = "CloudExitY";
+    private static final String CLOUD_SUBTERRANEAN_TAG = "CloudSubterranean";
     private static final String TERRAIN_EFFECT_ID_TAG = "TerrainEffectId";
     private static final String TERRAIN_STARTED_TAG = "TerrainStarted";
     private static final String TERRAIN_AGE_TAG = "TerrainAge";
@@ -253,6 +255,13 @@ public final class DetonationSavedData extends SavedData {
                                         0.0F,
                                         1.0F
                                 ),
+                                effectTag.contains(CLOUD_EXIT_Y_TAG, Tag.TAG_INT)
+                                        ? effectTag.getInt(CLOUD_EXIT_Y_TAG)
+                                        : centre.getY(),
+                                effectTag.contains(CLOUD_SUBTERRANEAN_TAG, Tag.TAG_BYTE)
+                                        ? effectTag.getBoolean(CLOUD_SUBTERRANEAN_TAG)
+                                        : (effectTag.getInt(CLOUD_EXIT_Y_TAG) > centre.getY() + 2
+                                           || effectTag.getInt(CLOUD_EXIT_Y_TAG) == Integer.MIN_VALUE),
                                 terrainEffectId,
                                 terrainStarted,
                                 terrainAgeTicks,
@@ -304,6 +313,8 @@ public final class DetonationSavedData extends SavedData {
             effectTag.putFloat(VISUAL_SCALE_TAG, effect.visualScale);
             effectTag.putInt(CLOUD_AGE_TAG, effect.cloudAgeTicks);
             effectTag.putFloat(CLOUD_STRENGTH_TAG, effect.cloudStrength);
+            effectTag.putInt(CLOUD_EXIT_Y_TAG, effect.cloudExitY);
+            effectTag.putBoolean(CLOUD_SUBTERRANEAN_TAG, effect.subterranean);
             effectTag.putLong(
                     TERRAIN_EFFECT_ID_TAG,
                     effect.terrainEffectId
@@ -378,7 +389,9 @@ public final class DetonationSavedData extends SavedData {
             int falloutDurationTicks,
             float falloutStrength,
             float visualScale,
-            float cloudStrength
+            float cloudStrength,
+            int cloudExitY,
+            boolean subterranean
     ) {
         effects.removeIf(effect ->
                 effect.dimension.equals(dimension)
@@ -403,6 +416,8 @@ public final class DetonationSavedData extends SavedData {
                         Math.max(1.0F, visualScale),
                         0,
                         Math.clamp(cloudStrength, 0.0F, 1.0F),
+                        cloudExitY,
+                        subterranean,
                         terrainEffectId,
                         false,
                         0,
@@ -787,7 +802,9 @@ public final class DetonationSavedData extends SavedData {
                             cloudActive,
                             effect.visualScale,
                             effect.cloudAgeTicks,
-                            effect.cloudStrength
+                            effect.cloudStrength,
+                            effect.cloudExitY,
+                            effect.subterranean
                     )
             );
         }
@@ -805,7 +822,9 @@ public final class DetonationSavedData extends SavedData {
             boolean cloudActive,
             float visualScale,
             int cloudAgeTicks,
-            float cloudStrength
+            float cloudStrength,
+            int cloudExitY,
+            boolean subterranean
     ) {
     }
 
@@ -814,6 +833,7 @@ public final class DetonationSavedData extends SavedData {
             ResourceKey<Level> dimension,
             BlockPos centre,
             float falloutRadius,
+            float falloutStrength,
             float visualScale,
             int terrainAgeTicks
     ) {
@@ -855,6 +875,8 @@ public final class DetonationSavedData extends SavedData {
         private final float falloutStrength;
         private final float visualScale;
         private final float cloudStrength;
+        private final int cloudExitY;
+        private final boolean subterranean;
         private final long terrainEffectId;
         private final Set<Long> legacyProcessedTerrainChunks;
         private final Set<Long> legacyPendingTerrainLodChunks;
@@ -883,6 +905,8 @@ public final class DetonationSavedData extends SavedData {
                 float visualScale,
                 int cloudAgeTicks,
                 float cloudStrength,
+                int cloudExitY,
+                boolean subterranean,
                 long terrainEffectId,
                 boolean terrainStarted,
                 int terrainAgeTicks,
@@ -907,6 +931,8 @@ public final class DetonationSavedData extends SavedData {
             this.visualScale = visualScale;
             this.cloudAgeTicks = cloudAgeTicks;
             this.cloudStrength = cloudStrength;
+            this.cloudExitY = cloudExitY;
+            this.subterranean = subterranean;
             this.terrainEffectId = terrainEffectId;
             this.terrainStarted = terrainStarted;
             this.terrainAgeTicks = Math.max(0, terrainAgeTicks);
@@ -1080,7 +1106,8 @@ public final class DetonationSavedData extends SavedData {
         }
 
         private boolean cloudActive() {
-            return cloudAgeTicks
+            return cloudStrength > 0.001F
+                    && cloudAgeTicks
                     < DetonationTuning.ParticleCloud.TOTAL_LIFETIME_TICKS;
         }
 
@@ -1090,6 +1117,7 @@ public final class DetonationSavedData extends SavedData {
                     dimension,
                     centre,
                     falloutRadius,
+                    falloutStrength,
                     visualScale,
                     terrainAgeTicks
             );

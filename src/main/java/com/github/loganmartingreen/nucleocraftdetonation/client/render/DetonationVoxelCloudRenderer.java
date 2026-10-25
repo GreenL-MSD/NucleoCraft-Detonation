@@ -6,6 +6,11 @@ import com.github.loganmartingreen.nucleocraftdetonation.config.DetonationClient
 import com.github.loganmartingreen.nucleocraftdetonation.config.DetonationTuning;
 import com.github.loganmartingreen.nucleocraftdetonation.particle.DetonationParticleSystem;
 import com.github.loganmartingreen.nucleocraftdetonation.particle.DetonationParticleSystem.CloudSnapshot;
+import com.github.loganmartingreen.nucleocraftdetonation.particle.DetonationParticleSystem.UndergroundSnapshot;
+import com.github.loganmartingreen.nucleocraftdetonation.particle.UndergroundVisualTimeline;
+import com.github.loganmartingreen.nucleocraftdetonation.particle.SurfaceCapThermalLayer;
+import com.github.loganmartingreen.nucleocraftdetonation.particle.SurfaceMushroomStem;
+import net.minecraft.core.BlockPos;
 import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.vertex.BufferBuilder;
 import com.mojang.blaze3d.vertex.BufferUploader;
@@ -56,7 +61,8 @@ public final class DetonationVoxelCloudRenderer {
         }
 
         List<CloudSnapshot> clouds = DetonationParticleSystem.snapshotClouds();
-        if (clouds.isEmpty()) {
+        List<UndergroundSnapshot> underground = DetonationParticleSystem.snapshotUnderground();
+        if (clouds.isEmpty() && underground.isEmpty()) {
             return;
         }
 
@@ -84,19 +90,34 @@ public final class DetonationVoxelCloudRenderer {
                 continue;
             }
 
-            double dx = cameraPosition.x - cloud.centreX();
-            double dy = cameraPosition.y - (cloud.centreY() + cloud.stemHeight() * 0.55D);
-            double dz = cameraPosition.z - cloud.centreZ();
+            SurfaceMushroomStem.Frame stem = SurfaceMushroomStem.frame(
+                    cloud.centreY(), cloud.capCentreY(), cloud.capVerticalRadius(),
+                    cloud.visualScale(), cloud.ageTicks());
+            double distanceSquared = SurfaceMushroomStem.distanceSquaredToCloud(
+                    cameraPosition.x, cameraPosition.y, cameraPosition.z,
+                    cloud.centreX(), cloud.centreZ(), stem,
+                    cloud.capCentreY() + cloud.capVerticalRadius());
             double viewDistance = Math.max(
                     DetonationTuning.ParticleCloud.MINIMUM_VIEW_DISTANCE,
                     DetonationParticleSystem.getLateExpandedCloudRadius(cloud.visualScale())
                             * DetonationTuning.ParticleCloud.VIEW_DISTANCE_MULTIPLIER
             );
-            if (dx * dx + dy * dy + dz * dz > viewDistance * viewDistance) {
+            if (distanceSquared > viewDistance * viewDistance) {
                 continue;
             }
 
             renderCloud(poseStack, cameraPosition, cloud);
+        }
+
+        ClientLevel level = Minecraft.getInstance().level;
+        if (level != null) {
+            for (UndergroundSnapshot shot : underground) {
+                double distanceSquared = cameraPosition.distanceToSqr(shot.x(), shot.y(), shot.z());
+                double viewDistance = Math.max(220.0D, shot.scale() * 15.0D);
+                if (distanceSquared <= viewDistance * viewDistance) {
+                    renderUnderground(poseStack, cameraPosition, level, shot);
+                }
+            }
         }
 
         RenderSystem.enableCull();
@@ -121,106 +142,290 @@ public final class DetonationVoxelCloudRenderer {
                 DefaultVertexFormat.POSITION_COLOR
         );
 
-        addStemBoxes(buffer, matrix, cloud);
-        addCapBoxes(buffer, matrix, cloud);
+        // Pass 1: the slightly more solid inner stem plus the cap's opaque
+        // heated body. Both sit beneath their smoke skins.
+        addStemInnerBoxes(buffer, matrix, cloud);
+        addCapThermalBoxes(buffer, matrix, cloud);
         addCapUndersideRing(buffer, matrix, cloud);
         addCraterRing(buffer, matrix, cloud);
+        var mesh = buffer.build();
+        if (mesh != null) {
+            BufferUploader.drawWithShader(mesh);
+        }
 
-        BufferUploader.drawWithShader(buffer.buildOrThrow());
+        // Pass 2: a THIN translucent exterior, not a full cloud of nested grey
+        // voxels. Do not write depth here: the solid inner layer remains visible
+        // through the near-facing smoke. This avoids the old hidden-core bug.
+        RenderSystem.depthMask(false);
+        try {
+            BufferBuilder smoke = Tesselator.getInstance().begin(
+                    VertexFormat.Mode.QUADS, DefaultVertexFormat.POSITION_COLOR);
+            addStemSmokeShellBoxes(smoke, matrix, cloud);
+            addCapSmokeShellBoxes(smoke, matrix, cloud);
+            var smokeMesh = smoke.build();
+            if (smokeMesh != null) {
+                BufferUploader.drawWithShader(smokeMesh);
+            }
+        } finally {
+            RenderSystem.depthMask(true);
+        }
         poseStack.popPose();
     }
 
-    private static void addStemBoxes(
-            BufferBuilder buffer,
-            Matrix4f matrix,
-            CloudSnapshot cloud
-    ) {
-        if (cloud.stemHeight() <= 1.0D) {
-            return;
+    /** Underground fireball and breakout jet use the same timeline as particles. */
+    private static void renderUnderground(PoseStack poses, Vec3 camera,
+                                          ClientLevel level, UndergroundSnapshot shot) {
+        poses.pushPose();
+        poses.translate(-camera.x, -camera.y, -camera.z);
+        Matrix4f matrix = poses.last().pose();
+        BufferBuilder buffer = Tesselator.getInstance().begin(
+                VertexFormat.Mode.QUADS, DefaultVertexFormat.POSITION_COLOR);
+        double radius = UndergroundVisualTimeline.fireballRadius(
+                shot.scale(), shot.age(), !shot.breakout());
+        if (radius > 0.5D) {
+            int slices = 12;
+            double interval = Math.max(1.6D, radius / 4.0D);
+            for (int layer = -slices / 2; layer <= slices / 2; layer++) {
+                double vertical = layer / (double) (slices / 2);
+                double y = shot.y() + radius * vertical
+                        * UndergroundVisualTimeline.fireballVerticalRatio(!shot.breakout());
+                double r = radius * Math.sqrt(Math.max(0.0D, 1.0D - vertical * vertical));
+                double cooling = UndergroundVisualTimeline.smooth((shot.age() - 42.0D) / 80.0D);
+                int rgb = UndergroundVisualTimeline.mix(0xFF8A2A, 0x444945, cooling);
+                addVisibleDisc(buffer, matrix, level, shot.x(), y, shot.z(), r,
+                        interval, interval * 1.15D, rgb, 245, layer * 19);
+            }
         }
+        if (shot.breakout() && shot.age() >= UndergroundVisualTimeline.JET_START_TICK) {
+            double top = UndergroundVisualTimeline.jetTop(
+                    shot.y(), shot.exitY(), shot.scale(), shot.age());
+            double length = top - shot.y();
+            if (length > 0.5D) {
+                int slices = Math.clamp((int) Math.ceil(length / Math.max(1.5D, shot.scale() * 0.10D)),
+                        12, 58);
+                for (int layer = 0; layer <= slices; layer++) {
+                    double h = layer / (double) slices;
+                    double y = shot.y() + length * h;
+                    double radiusAtY = UndergroundVisualTimeline.jetRadius(
+                            shot.y(), shot.exitY(), y, shot.scale());
+                    double cell = Math.max(1.5D, radiusAtY * 0.42D);
+                    double cooling = UndergroundVisualTimeline.cooling(shot.age(), y, shot.y(), top);
+                    int rgb = UndergroundVisualTimeline.jetColour(shot.age(), h, cooling);
+                    int alpha = (int) Math.round(255.0D *
+                            UndergroundVisualTimeline.jetAlpha(shot.age(), h, 0.3D));
+                    if (alpha < 6) continue;
+                    // The inner column stays upright and translucent; the
+                    // radial alpha is calculated for each individual voxel.
+                    addVisibleDisc(buffer, matrix, level,
+                            shot.x(), y, shot.z(), radiusAtY,
+                            cell, Math.max(cell * 1.2D, length / slices * 1.12D),
+                            rgb, alpha, layer * 23, shot.age(), h);
+                    if (layer % 3 == 0 && y >= shot.exitY()) {
+                        addJetFringe(buffer, matrix, level, shot,
+                                y, radiusAtY, cell, length / slices, h, top, layer);
+                    }
+                }
+            }
+        }
+        // A voxel effect can produce no quads when the remaining fireball is
+        // completely occluded by terrain or the jet has fully faded.
+        // buildOrThrow() crashes in exactly that legitimate situation.
+        // build() returns null for an empty frame, which should be skipped.
+        var mesh = buffer.build();
+        if (mesh != null) {
+            BufferUploader.drawWithShader(mesh);
+        }
+        poses.popPose();
+    }
 
-        double matureRadius = DetonationParticleSystem.getMatureCloudRadius(cloud.visualScale());
-        int layers = DetonationTuning.DistantHorizons.STEM_LAYERS;
+    /** Fixed upper bound on geometry to avoid overwhelming the game at huge yields. */
+    private static void addVisibleDisc(BufferBuilder buffer, Matrix4f matrix,
+            ClientLevel level, double x, double y, double z, double radius,
+            double cell, double height, int rgb, int alpha, int seed) {
+        addVisibleDisc(buffer, matrix, level, x, y, z, radius, cell,
+                height, rgb, alpha, seed, -1, 0.0D);
+    }
 
-        for (int layer = 0; layer < layers; layer++) {
-            double heightProgress = layer / (double) Math.max(1, layers - 1);
-            double verticalTaper = 1.05D - 0.47D * smoothstep(heightProgress);
-            double bulge = 0.96D + 0.10D * Math.sin(heightProgress * Math.PI);
-            double middleCurve = 1.0D
-                    - DetonationTuning.ParticleCloud.STEM_MIDDLE_CURVE_STRENGTH
-                    * Math.pow(
-                    Math.sin(heightProgress * Math.PI),
-                    DetonationTuning.ParticleCloud.STEM_MIDDLE_CURVE_POWER
-            );
-            double localRadius = matureRadius
-                    * DetonationTuning.ParticleCloud.STEM_RADIUS_RATIO
-                    * verticalTaper
-                    * bulge
-                    * middleCurve;
-            double y = cloud.stemBaseY() + cloud.stemHeight() * heightProgress;
-            double boxSize = Math.max(
-                    1.75D,
-                    localRadius * 0.30D
-            );
-            double layerSpacing = cloud.stemHeight() / Math.max(1.0D, layers - 1.0D);
-            double boxHeight = Math.max(boxSize * 1.20D, layerSpacing * 1.16D);
-
-            addFilledDiscBoxes(
-                    buffer,
-                    matrix,
-                    cloud.centreX(),
-                    y,
-                    cloud.centreZ(),
-                    localRadius,
-                    boxSize,
-                    boxHeight,
-                    cloudColour(cloud.visualScale(), cloud.ageTicks(), -12),
-                    layer * 17
-            );
+    private static void addVisibleDisc(BufferBuilder buffer, Matrix4f matrix,
+            ClientLevel level, double x, double y, double z, double radius,
+            double cell, double height, int rgb, int alpha, int seed,
+            int jetAge, double heightProgress) {
+        if (radius <= 0.0D) return;
+        double spacing = Math.max(1.0D, cell * 0.78D);
+        int extent = Math.min(13, (int) Math.ceil(radius / spacing));
+        for (int gx = -extent; gx <= extent; gx++) {
+            for (int gz = -extent; gz <= extent; gz++) {
+                double dx = gx * spacing, dz = gz * spacing;
+                double radial = Math.hypot(dx, dz) / Math.max(1.0D, radius);
+                if (radial > 1.07D) continue;
+                double bx = x + dx, bz = z + dz;
+                // A true underground visual: never draw through still-solid terrain.
+                if (!level.getBlockState(BlockPos.containing(bx, y, bz)).isAir()) continue;
+                int fadeAlpha = jetAge >= 0
+                        ? (int) Math.round(255.0D * UndergroundVisualTimeline.jetAlpha(
+                                jetAge, heightProgress, radial))
+                        : (int) (alpha * (1.0D - 0.08D *
+                                UndergroundVisualTimeline.smooth((radial - 0.8D) / 0.27D)));
+                if (fadeAlpha < 6) continue;
+                int base = (fadeAlpha << 24) | rgb;
+                addBoxCentred(buffer, matrix, bx, y, bz, cell, height,
+                        organicShade(base, seed, gx, gz));
+            }
         }
     }
 
-    private static void addCapBoxes(
-            BufferBuilder buffer,
-            Matrix4f matrix,
-            CloudSnapshot cloud
-    ) {
-        int layers = Math.max(DetonationTuning.DistantHorizons.CAP_LAYERS + 2, 6);
-        int baseColour = cloudColour(cloud.visualScale(), cloud.ageTicks(), 0);
+    /** Light, ragged side shedding and an outward-breaking head. Never a cap. */
+    private static void addJetFringe(BufferBuilder buffer, Matrix4f matrix,
+            ClientLevel level, UndergroundSnapshot shot, double y, double radius,
+            double cell, double sliceHeight, double heightProgress,
+            double jetTop, int layer) {
+        boolean head = heightProgress > 0.78D;
+        double breakup = UndergroundVisualTimeline.breakup(shot.age(), heightProgress);
+        int alpha = (int) Math.round(255.0D * UndergroundVisualTimeline.fringeAlpha(
+                shot.age(), heightProgress, head));
+        if (alpha < 6) return;
+        double cool = UndergroundVisualTimeline.cooling(shot.age(), y, shot.y(), jetTop);
+        int hot = UndergroundVisualTimeline.jetColour(shot.age(), heightProgress, cool);
+        int rgb = UndergroundVisualTimeline.mix(hot, 0x747874, 0.32D + cool * 0.54D);
+        int parts = head ? 16 : 10;
+        for (int i = 0; i < parts; i++) {
+            double angle = i * Math.PI * 2.0D / parts + layer * 0.37D;
+            double irregular = (Math.sin(i * 12.73D + layer * 7.1D) + 1.0D) * 0.5D;
+            double distance = radius * (1.05D + irregular * (0.27D + breakup * 0.65D));
+            double x = shot.x() + Math.cos(angle) * distance;
+            double z = shot.z() + Math.sin(angle) * distance;
+            double fy = y + (irregular - 0.5D) * Math.max(cell, sliceHeight);
+            if (!level.getBlockState(BlockPos.containing(x, fy, z)).isAir()) continue;
+            int shade = UndergroundVisualTimeline.mix(rgb, 0x797C78, irregular * 0.20D);
+            addBoxCentred(buffer, matrix, x, fy, z,
+                    cell * (head ? 0.87D : 0.72D),
+                    Math.max(cell, sliceHeight * 1.55D),
+                    argb(alpha, (shade >> 16) & 255, (shade >> 8) & 255, shade & 255));
+        }
+    }
+
+    /** Slightly more solid inset body for the rewritten v42.7 stem. */
+    private static void addStemInnerBoxes(BufferBuilder buffer, Matrix4f matrix,
+                                          CloudSnapshot cloud) {
+        addStemComponent(buffer, matrix, cloud, true);
+    }
+
+    /** Thin translucent outer smoke skin for the rewritten v42.7 stem. */
+    private static void addStemSmokeShellBoxes(BufferBuilder buffer, Matrix4f matrix,
+                                               CloudSnapshot cloud) {
+        addStemComponent(buffer, matrix, cloud, false);
+    }
+
+    private static void addStemComponent(BufferBuilder buffer, Matrix4f matrix,
+                                         CloudSnapshot cloud, boolean inner) {
+        SurfaceMushroomStem.Frame frame = SurfaceMushroomStem.frame(
+                cloud.centreY(), cloud.capCentreY(), cloud.capVerticalRadius(),
+                cloud.visualScale(), cloud.ageTicks());
+        if (!frame.visible()) return;
+        int slices = SurfaceMushroomStem.slices(frame);
+        double verticalStep = frame.height() / Math.max(1.0D, slices - 1.0D);
+        for (int layer = 0; layer < slices; layer++) {
+            double h = layer / (double) (slices - 1);
+            double radius = SurfaceMushroomStem.radius(frame, h);
+            double innerRadius = SurfaceMushroomStem.innerRadius(frame, h);
+            double cell = SurfaceMushroomStem.voxelSize(radius);
+            double boxHeight = Math.max(cell * 1.18D, verticalStep * 1.20D);
+            double cy = frame.bottomY() + frame.height() * h;
+            double spacing = Math.max(1.2D, cell * 0.92D);
+            int extent = Math.max(0, (int) Math.ceil(radius / spacing));
+            for (int gx = -extent; gx <= extent; gx++) {
+                for (int gz = -extent; gz <= extent; gz++) {
+                    double x = gx * spacing, z = gz * spacing;
+                    double distance = Math.hypot(x, z);
+                    double usedRadius = inner ? innerRadius : radius;
+                    if (distance > usedRadius + cell * 0.14D) continue;
+                    if (!inner) {
+                        double shellStart = Math.max(0.0D, innerRadius - cell * 0.22D);
+                        if (distance < shellStart && h < 0.985D) continue;
+                    }
+                    double radial = distance / Math.max(1.0D, usedRadius);
+                    int rgb = inner
+                            ? SurfaceMushroomStem.innerColour(frame.age(), h, radial)
+                            : SurfaceMushroomStem.shellColour(frame.scale(), frame.age(), h);
+                    int alpha = inner
+                            ? SurfaceMushroomStem.innerOpacity(frame.age(), radial, h)
+                            : SurfaceMushroomStem.shellOpacity(frame.age(),
+                                    distance / Math.max(1.0D, radius));
+                    if (alpha <= 5) continue;
+                    int colour = argb(alpha, (rgb >>> 16) & 255,
+                            (rgb >>> 8) & 255, rgb & 255);
+                    addBoxCentred(buffer, matrix, cloud.centreX() + x, cy,
+                            cloud.centreZ() + z, cell, boxHeight,
+                            organicShade(colour, layer * 17 + (inner ? 5 : 11), gx, gz));
+                }
+            }
+        }
+    }
+
+    /** Separate thermal voxel component. Surface mushrooms only. */
+    private static void addCapThermalBoxes(BufferBuilder buffer, Matrix4f matrix,
+                                           CloudSnapshot cloud) {
+        addCapComponent(buffer, matrix, cloud, true);
+    }
+
+    /** Single outer smoke layer; no nested grey voxels hiding the inner heat. */
+    private static void addCapSmokeShellBoxes(BufferBuilder buffer, Matrix4f matrix,
+                                              CloudSnapshot cloud) {
+        addCapComponent(buffer, matrix, cloud, false);
+    }
+
+    private static void addCapComponent(BufferBuilder buffer, Matrix4f matrix,
+                                        CloudSnapshot cloud, boolean thermal) {
+        int layers = Math.max(DetonationTuning.DistantHorizons.CAP_LAYERS + 5, 12);
         double verticalSpan = cloud.capVerticalRadius() * 1.84D;
         double layerSpacing = verticalSpan / Math.max(1.0D, layers - 1.0D);
-
         for (int layer = 0; layer < layers; layer++) {
-            double verticalNormal = layers == 1
-                    ? 0.0D
-                    : (layer / (double) (layers - 1)) * 2.0D - 1.0D;
-            double layerY = cloud.capCentreY()
-                    + verticalNormal * cloud.capVerticalRadius() * 0.92D;
-            double radiusFactor = Math.sqrt(
-                    Math.max(0.16D, 1.0D - verticalNormal * verticalNormal * 0.76D)
-            );
-            double layerRadius = cloud.capRadius() * (radiusFactor + 0.04D);
-            double boxSize = Math.max(
-                    4.0D,
-                    layerRadius * DetonationTuning.DistantHorizons.CAP_BOX_RADIUS_RATIO
-            );
-            double boxHeight = Math.max(
-                    4.0D,
-                    Math.max(cloud.capVerticalRadius() * 0.34D, layerSpacing * 1.14D)
-            );
+            double v = layers == 1 ? 0.0D
+                    : layer / (double) (layers - 1) * 2.0D - 1.0D;
+            double layerY = cloud.capCentreY() + v * cloud.capVerticalRadius() * 0.92D;
+            double factor = Math.sqrt(Math.max(0.16D, 1.0D - v * v * 0.76D));
+            double radius = cloud.capRadius() * (factor + 0.04D);
+            double box = Math.max(4.0D,
+                    radius * DetonationTuning.DistantHorizons.CAP_BOX_RADIUS_RATIO);
+            double height = Math.max(4.0D,
+                    Math.max(cloud.capVerticalRadius() * 0.34D, layerSpacing * 1.14D));
+            addCapComponentDisc(buffer, matrix, cloud.centreX(), layerY, cloud.centreZ(),
+                    radius, box, height, cloud.visualScale(), cloud.ageTicks(),
+                    layer * 31, v, thermal);
+        }
+    }
 
-            addFilledDiscBoxes(
-                    buffer,
-                    matrix,
-                    cloud.centreX(),
-                    layerY,
-                    cloud.centreZ(),
-                    layerRadius,
-                    boxSize,
-                    boxHeight,
-                    baseColour,
-                    layer * 31
-            );
+    private static void addCapComponentDisc(BufferBuilder buffer, Matrix4f matrix,
+            double cx, double y, double cz, double radius, double box,
+            double height, float scale, int age, int seed, double v,
+            boolean thermal) {
+        double spacing = Math.max(1.0D, box * Math.min(0.72D,
+                DetonationTuning.DistantHorizons.BOX_SPACING_RATIO));
+        double coreRadius = SurfaceCapThermalLayer.coreRadius(radius, box);
+        int extent = Math.max(0, (int) Math.ceil(radius / spacing));
+        double accepted = radius + box * 0.44D;
+        for (int gx = -extent; gx <= extent; gx++) {
+            for (int gz = -extent; gz <= extent; gz++) {
+                double px = gx * spacing, pz = gz * spacing;
+                double distance = Math.hypot(px, pz);
+                if (thermal) {
+                    if (distance > coreRadius) continue;
+                } else {
+                    if (distance > accepted || !SurfaceCapThermalLayer.smokeCell(
+                            distance, radius, box, v)) continue;
+                }
+                int rgb = thermal
+                        ? SurfaceCapThermalLayer.thermalRgb(age,
+                                distance / Math.max(1.0D, coreRadius), v)
+                        : DetonationParticleSystem.getCapShellColour(scale, age, 0.99D);
+                int fade = DetonationParticleSystem.getCloudVoxelAlpha(age);
+                int alpha = thermal ? fade : (int) Math.round(
+                        SurfaceCapThermalLayer.smokeAlpha(v) * fade / 255.0D);
+                if (alpha < 6) continue;
+                int colour = argb(alpha, (rgb >>> 16) & 255, (rgb >>> 8) & 255, rgb & 255);
+                addBoxCentred(buffer, matrix, cx + px, y, cz + pz,
+                        box, height, organicShade(colour, seed, gx, gz));
+            }
         }
     }
 
@@ -232,6 +437,11 @@ public final class DetonationVoxelCloudRenderer {
         if (!cloud.atMaximumHeight()) {
             return;
         }
+        // The dark underside ring must accumulate over time instead of
+        // appearing as a fully opaque mechanical collar in a single frame.
+        double visibility = DetonationParticleSystem.getCapUndersideRingVisibility(
+                cloud.visualScale(), cloud.ageTicks());
+        if (visibility <= 0.0D) return;
 
         double ringRadius = cloud.capRadius()
                 * DetonationTuning.ParticleCloud.CAP_UNDERSIDE_RING_RADIUS_RATIO;
@@ -248,8 +458,8 @@ public final class DetonationVoxelCloudRenderer {
         for (int segment = 0; segment < segments; segment++) {
             double angle = segment / (double) segments * Math.PI * 2.0D;
             int colour = segment % 4 == 0
-                    ? argb(230, 75, 74, 70)
-                    : argb(235, 41, 44, 43);
+                    ? argb((int) Math.round(230 * visibility), 75, 74, 70)
+                    : argb((int) Math.round(235 * visibility), 41, 44, 43);
             addBoxCentred(
                     buffer,
                     matrix,
@@ -352,6 +562,14 @@ public final class DetonationVoxelCloudRenderer {
                 );
             }
         }
+    }
+
+    private static int stemRingColour(float scale, int age, double height, int shade) {
+        int rgb = DetonationParticleSystem.getStemBandColour(scale, age, height,
+                DetonationParticleSystem.getStemLayerColour(scale, age, height, shade));
+        int alpha = (int) Math.round(255.0D *
+                (1.0D - DetonationParticleSystem.getStemDissipation(age)));
+        return argb(alpha, (rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255);
     }
 
     private static int getOverlappingRingSegments(double radius, double boxSize) {

@@ -11,14 +11,15 @@ import com.github.loganmartingreen.nucleocraftdetonation.network.DetonationNetwo
 import com.github.loganmartingreen.nucleocraftdetonation.network.DetonationNetwork.PersistentVisualSyncPayload;
 import com.github.loganmartingreen.nucleocraftdetonation.particle.DetonationParticleSystem;
 import com.github.loganmartingreen.nucleocraftdetonation.sound.DetonationSounds;
-import com.mojang.blaze3d.shaders.FogShape;
 
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.core.particles.DustParticleOptions;
 import net.minecraft.sounds.SoundSource;
-import net.minecraft.world.level.material.FogType;
+import net.minecraft.world.level.ClipContext;
+import net.minecraft.world.phys.HitResult;
+import net.minecraft.world.phys.Vec3;
 
 import net.neoforged.api.distmarker.Dist;
 import net.neoforged.bus.api.SubscribeEvent;
@@ -27,7 +28,6 @@ import net.neoforged.neoforge.client.event.ClientPlayerNetworkEvent;
 import net.neoforged.neoforge.client.event.ClientTickEvent;
 import net.neoforged.neoforge.client.event.RenderGuiEvent;
 import net.neoforged.neoforge.client.event.ScreenEvent;
-import net.neoforged.neoforge.client.event.ViewportEvent;
 import net.neoforged.neoforge.network.PacketDistributor;
 
 import org.joml.Vector3f;
@@ -42,7 +42,7 @@ import java.util.List;
  * <p>The custom fireball and mushroom-cloud particles are implemented in
  * {@link DetonationParticleSystem}. The two solid shockwave rings are
  * implemented in {@link DetonationShockwaveRenderer}. This class retains the
- * flash, delayed sound, fallout atmosphere and client lifecycle cleanup.</p>
+ * flash, delayed sound, fallout particles/sky treatment and client lifecycle cleanup.</p>
  */
 @EventBusSubscriber(
         modid = NucleoCraftDetonation.MOD_ID,
@@ -159,13 +159,15 @@ public final class DetonationClient {
                             && entry.cloudAgeTicks()
                             < DetonationTuning.ParticleCloud.TOTAL_LIFETIME_TICKS
             ) {
-                DetonationParticleSystem.start(
+                startMushroomCloud(
                         entry.centre().getX() + 0.5D,
                         entry.centre().getY() + 0.5D,
                         entry.centre().getZ() + 0.5D,
                         entry.visualScale(),
                         entry.cloudStrength(),
-                        entry.cloudAgeTicks()
+                        entry.cloudAgeTicks(),
+                        entry.cloudExitY(),
+                        entry.subterranean()
                 );
             }
         }
@@ -205,6 +207,10 @@ public final class DetonationClient {
                         payload.flashRadius(),
                         DetonationTuning.ImmediateEffects.FULL_FLASH_RADIUS_RATIO
                 ) * strength;
+        // Initial light does not pass through intact rock. A surface detonation
+        // viewed from behind still produces a weaker peripheral flash.
+        flashStrength *= initialFlashVisibility(minecraft, centreX, centreY, centreZ,
+                visualScale, payload.cloudExitY());
 
         float soundStrength =
                 calculateDistanceStrength(
@@ -232,21 +238,105 @@ public final class DetonationClient {
             );
         }
 
-        DetonationParticleSystem.start(
-                centreX,
-                centreY,
-                centreZ,
-                visualScale,
-                strength
-        );
+        if (payload.cloudExitY() != Integer.MIN_VALUE) {
+            startMushroomCloud(
+                    centreX,
+                    centreY,
+                    centreZ,
+                    visualScale,
+                    strength,
+                    0,
+                    payload.cloudExitY(),
+                    payload.subterranean()
+            );
+        }
 
-        DetonationShockwaveRenderer.start(
-                centreX,
-                centreY,
-                centreZ,
-                visualScale,
-                strength
-        );
+        if (payload.cloudExitY() == Integer.MIN_VALUE) {
+            // Sealed underground effects do not cause a visible surface shockwave.
+            DetonationParticleSystem.startSealed(
+                    centreX, centreY, centreZ, visualScale, strength);
+        } else if (!payload.subterranean() && payload.shockwaveStrength() > 0.001F) {
+            // Shockwaves are surface-only. Both breakout and sealed underground
+            // events use fireball/jet visuals with no surface atmospheric rings.
+            DetonationShockwaveRenderer.start(
+                    centreX, centreY, centreZ, visualScale,
+                    Math.clamp(payload.shockwaveStrength(), 0.0F, 1.0F)
+            );
+        }
+    }
+
+    private static float initialFlashVisibility(Minecraft minecraft,
+            double x, double y, double z, float visualScale, int surfaceExitY) {
+        if (minecraft.player == null || minecraft.level == null) return 0.0F;
+        Vec3 eyes = minecraft.player.getEyePosition();
+        Vec3 origin = new Vec3(x, y, z);
+        Vec3 toward = origin.subtract(eyes);
+        if (toward.lengthSqr() < 0.0001D) return 1.0F;
+        boolean underground = surfaceExitY == Integer.MIN_VALUE
+                || surfaceExitY + 0.5D > y + 2.0D;
+        double offset = Math.clamp(visualScale * 0.12D, 1.0D, 12.0D);
+        Vec3[] samples = underground
+                ? new Vec3[]{origin, origin.add(0.0D, offset * 0.3D, 0.0D)}
+                : new Vec3[]{origin, origin.add(0.0D, offset, 0.0D),
+                    origin.add(offset, 0.0D, 0.0D), origin.add(-offset, 0.0D, 0.0D),
+                    origin.add(0.0D, 0.0D, offset), origin.add(0.0D, 0.0D, -offset)};
+        boolean visible = false;
+        for (Vec3 sample : samples) {
+            HitResult hit = minecraft.level.clip(new ClipContext(eyes, sample,
+                    ClipContext.Block.COLLIDER, ClipContext.Fluid.NONE,
+                    minecraft.player));
+            if (hit.getType() == HitResult.Type.MISS
+                    || hit.getLocation().distanceToSqr(sample) < 0.6D) {
+                visible = true;
+                break;
+            }
+        }
+        if (!visible) return 0.0F;
+        double alignment = minecraft.player.getLookAngle().normalize().dot(toward.normalize());
+        if (underground) {
+            // No wall-penetrating flashes; only the directly observable ignition.
+            return (float) Math.clamp((alignment + 0.10D) / 0.75D, 0.0D, 1.0D);
+        }
+        // Bright peripheral flash for an unoccluded surface burst even when facing away.
+        return (float) (0.12D + 0.88D * Math.clamp(
+                (alignment + 0.25D) / 0.95D, 0.0D, 1.0D));
+    }
+
+    private static void startMushroomCloud(
+            double centreX,
+            double centreY,
+            double centreZ,
+            float visualScale,
+            float strength,
+            int ageTicks,
+            int cloudExitY,
+            boolean subterranean
+    ) {
+        if (cloudExitY == Integer.MIN_VALUE || strength <= 0.001F) {
+            return;
+        }
+
+        double surfaceExitY = cloudExitY + 0.5D;
+        if (subterranean) {
+            DetonationParticleSystem.startBreakout(
+                    centreX,
+                    centreY,
+                    centreZ,
+                    surfaceExitY,
+                    visualScale,
+                    strength,
+                    ageTicks
+            );
+        } else {
+            DetonationParticleSystem.start(
+                    centreX,
+                    centreY,
+                    centreZ,
+                    visualScale,
+                    strength,
+                    ageTicks
+            );
+        }
     }
 
     /**
@@ -345,106 +435,6 @@ public final class DetonationClient {
             ScreenEvent.Render.Post event
     ) {
         drawFlash(event.getGuiGraphics());
-    }
-
-    @SubscribeEvent
-    public static void onFogColour(
-            ViewportEvent.ComputeFogColor event
-    ) {
-        if (
-                event.getCamera().getFluidInCamera()
-                        != FogType.NONE
-        ) {
-            return;
-        }
-
-        float intensity = falloutIntensity();
-
-        if (intensity <= 0.001F) {
-            return;
-        }
-
-        float blendStrength = Math.clamp(
-                intensity
-                        * DetonationTuning.Fallout.FOG_COLOUR_STRENGTH,
-                0.0F,
-                1.0F
-        );
-
-        event.setRed(
-                lerp(
-                        event.getRed(),
-                        DetonationTuning.Fallout.FOG_RED,
-                        blendStrength
-                )
-        );
-
-        event.setGreen(
-                lerp(
-                        event.getGreen(),
-                        DetonationTuning.Fallout.FOG_GREEN,
-                        blendStrength
-                )
-        );
-
-        event.setBlue(
-                lerp(
-                        event.getBlue(),
-                        DetonationTuning.Fallout.FOG_BLUE,
-                        blendStrength
-                )
-        );
-    }
-
-    @SubscribeEvent
-    public static void onRenderFog(
-            ViewportEvent.RenderFog event
-    ) {
-        if (event.getType() != FogType.NONE) {
-            return;
-        }
-
-        float intensity = falloutIntensity();
-
-        if (intensity <= 0.001F) {
-            return;
-        }
-
-        float vanillaNear = event.getNearPlaneDistance();
-        float vanillaFar = event.getFarPlaneDistance();
-
-        float targetFalloutFar = Math.max(
-                DetonationTuning.Fallout.FOG_MIN_END_DISTANCE_BLOCKS,
-                Math.min(
-                        DetonationTuning.Fallout.FOG_END_DISTANCE_BLOCKS,
-                        vanillaFar * DetonationTuning.Fallout.FOG_END_RENDER_RATIO
-                )
-        );
-        float falloutFar = lerp(
-                vanillaFar,
-                targetFalloutFar,
-                intensity
-        );
-        float falloutNear = falloutFar
-                * DetonationTuning.Fallout.FOG_START_RATIO;
-
-        falloutNear = Math.clamp(
-                falloutNear,
-                0.0F,
-                Math.max(0.0F, falloutFar - 12.0F)
-        );
-
-        event.setNearPlaneDistance(
-                lerp(
-                        vanillaNear,
-                        falloutNear,
-                        intensity
-                )
-        );
-
-        event.setFarPlaneDistance(falloutFar);
-        event.setFogShape(FogShape.SPHERE);
-        event.setCanceled(true);
     }
 
     @SubscribeEvent

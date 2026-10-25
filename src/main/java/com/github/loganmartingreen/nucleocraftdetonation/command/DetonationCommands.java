@@ -42,11 +42,26 @@ public final class DetonationCommands {
                                                         ))
                                         )
                         )
+                        .then(Commands.literal("debug")
+                                .then(Commands.literal("on")
+                                        .executes(context -> setDebug(context.getSource(), true)))
+                                .then(Commands.literal("off")
+                                        .executes(context -> setDebug(context.getSource(), false))))
                         .then(
                                 Commands.literal("clearclouds")
                                         .executes(context -> clearClouds(context.getSource()))
                         )
         );
+    }
+
+    private static int setDebug(CommandSourceStack source, boolean enabled) {
+        try {
+            DetonationManager.setDebug(source.getPlayerOrException(), enabled);
+            return 1;
+        } catch (Exception e) {
+            source.sendFailure(Component.literal("Debug command must be run by a player."));
+            return 0;
+        }
     }
 
     private static int clearClouds(CommandSourceStack source) {
