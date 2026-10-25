@@ -1,6 +1,0 @@
-{
-  "parent": "minecraft:block/cube_all",
-  "textures": {
-    "all": "nucleocraft_detonation:block/charred_dirt"
-  }
-}
