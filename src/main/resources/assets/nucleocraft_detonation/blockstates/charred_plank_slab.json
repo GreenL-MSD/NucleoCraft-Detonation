@@ -1,7 +1,0 @@
-{
-  "variants": {
-    "type=bottom": { "model": "nucleocraft_detonation:block/charred_plank_slab" },
-    "type=double": { "model": "nucleocraft_detonation:block/charred_planks" },
-    "type=top": { "model": "nucleocraft_detonation:block/charred_plank_slab_top" }
-  }
-}
