@@ -1,0 +1,8 @@
+{
+  "replace": false,
+  "values": [
+    "nucleocraft_detonation:rad_grass",
+    "nucleocraft_detonation:charred_dirt",
+    "nucleocraft_detonation:charred_sand"
+  ]
+}

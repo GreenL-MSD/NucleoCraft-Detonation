@@ -1,0 +1,8 @@
+{
+  "parent": "minecraft:block/outer_stairs",
+  "textures": {
+    "bottom": "nucleocraft_detonation:block/charred_planks",
+    "top": "nucleocraft_detonation:block/charred_planks",
+    "side": "nucleocraft_detonation:block/charred_planks"
+  }
+}
